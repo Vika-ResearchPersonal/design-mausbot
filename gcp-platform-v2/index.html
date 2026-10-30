@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow">
+<title>GCP Application Platform Design v2 — Binance Execution Service</title>
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 60rem; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+  a { color: #0b5fff; }
+  h1 { line-height: 1.25; } h2 { margin-top: 2.5rem; border-bottom: 1px solid #e5e5e5; padding-bottom: .3rem; } h3 { margin-top: 1.8rem; }
+  .meta { color: #666; margin-top: -.5rem; }
+  nav { background: #f6f7f9; border: 1px solid #e5e7eb; border-radius: 6px; padding: .8rem 1.2rem; margin: 1.5rem 0; }
+  nav ol { margin: .4rem 0 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #e5e7eb; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #f6f7f9; }
+  code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; padding: .1em .3em; border-radius: 3px; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 6px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; padding: 0; color: inherit; }
+  figure { margin: 1.5rem 0; } figure img { width: 100%; border: 1px solid #e5e7eb; border-radius: 6px; }
+  figcaption { color: #666; font-size: .85rem; }
+  li input[type=checkbox] { margin-right: .4rem; }
+</style></head>
+<body>
+<h1 id="gcp-application-platform-design-v2-with-binance-execution-service">GCP Application Platform Design v2 — with Binance Execution Service</h1>
+<p class="meta">Version 2 · Updated 30 Oct 2026 · <a href="../gcp-platform/">Version 1 (platform only)</a></p>
+<nav><strong>Contents</strong><ol><li><a href="#overview">Overview</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#components">Components</a></li><li><a href="#binance-execution-service">Binance execution service</a></li><li><a href="#observability-and-security-monitoring">Observability and security monitoring</a></li><li><a href="#network-design">Network design</a></li><li><a href="#security-design">Security design</a></li><li><a href="#implementation-steps">Implementation steps</a></li><li><a href="#operations">Operations</a></li><li><a href="#risks-and-open-decisions">Risks and open decisions</a></li></ol></nav>
+<h2 id="overview">Overview</h2>
+<p>v2 keeps the v1 platform unchanged and adds a <strong>Binance execution service</strong> in its own GCP project, so that compromising the main application, its load balancer or its GCP project is not enough to move funds. The service is the only holder of the Binance funding credentials. It executes a payment only after it has itself verified ops Passkey approvals bound to the exact, immutable payment instruction.</p>
+<p><strong>What v2 adds over v1</strong></p>
+<ul>
+<li>A separate execution project with its own VPC, service accounts, IAM, load balancer and deploy pipeline.</li>
+<li>A trusted approval screen on its own origin (<code>approve.&lt;domain&gt;</code>), served from inside that project.</li>
+<li>WebAuthn verification, an approver registry, a policy engine, a durable execution state machine and a reconciliation worker.</li>
+<li>Locked egress: one static IP, allowed to reach only the Binance API hostnames.</li>
+<li>A tamper-resistant audit store outside the execution servers.</li>
+<li>A narrow private API from TMS / the main backend: create an instruction, read its status. Nothing else.</li>
+</ul>
+<p><strong>Scope:</strong> one region; the main platform as in v1; Binance funding operations (withdrawals and, if approved, internal transfers) moved out of the main backend.</p>
+<p><strong>Assumptions</strong> (change these if they don't hold):</p>
+<ul>
+<li>Region <code>asia-southeast1</code> (Singapore) or <code>asia-southeast2</code> (Jakarta), chosen for data residency.</li>
+<li>TMS creates payment requests and remains the system of record for business state; the execution service is the system of record for approval and execution state.</li>
+<li>Ops approvers use platform Passkeys (device-bound or synced) on managed devices.</li>
+<li>A public DNS name for the API (<code>api.&lt;domain&gt;</code>) and a separate one for approvals (<code>approve.&lt;domain&gt;</code>).</li>
+</ul>
+<p><strong>Key design decisions</strong></p>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Choice</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge load balancer (main app)</td>
+<td>Global external Application LB (<code>EXTERNAL_MANAGED</code>)</td>
+<td>Cloud Armor, Adaptive Protection and Google-managed certificates at the global edge</td>
+</tr>
+<tr>
+<td>WAF</td>
+<td>Cloud Armor backend security policies</td>
+<td>OWASP preconfigured rules, rate limiting, geo and IP rules</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Apache APISIX in Docker on VMs, standalone mode</td>
+<td>Runs inside the VPC; config versioned in Git and shipped by CI</td>
+</tr>
+<tr>
+<td>Gateway to app</td>
+<td>APISIX upstream lists the app VMs' fixed internal IPs, with active health checks</td>
+<td>No internal LB to operate</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>OpenTelemetry → Prometheus, Loki, Tempo, Grafana</td>
+<td>One pipeline for metrics, logs and traces</td>
+</tr>
+<tr>
+<td>Security monitoring</td>
+<td>Wazuh with an agent on every VM</td>
+<td>Host intrusion detection, FIM, CIS checks, vulnerability detection, SIEM</td>
+</tr>
+<tr>
+<td><strong>Funds movement</strong></td>
+<td><strong>Dedicated execution service in a separate GCP project</strong></td>
+<td>Only this service can reach Binance credentials; main-app compromise alone cannot move funds</td>
+</tr>
+<tr>
+<td><strong>Approval</strong></td>
+<td><strong>WebAuthn challenge = hash of the canonical instruction + single-use nonce, verified by the execution service</strong></td>
+<td>Approval covers the exact transaction; no trust in an "approved" flag from TMS</td>
+</tr>
+<tr>
+<td><strong>Approval UI</strong></td>
+<td><strong>Own origin, own LB and Cloud Armor policy in the execution project</strong></td>
+<td>The screen ops trust cannot be swapped by whoever controls the main LB or APISIX</td>
+</tr>
+<tr>
+<td><strong>Execution safety</strong></td>
+<td><strong>Postgres state machine with a unique payment UUID, atomic reservation, reconciliation before retry</strong></td>
+<td>No duplicate or blind re-sent transfers</td>
+</tr>
+<tr>
+<td><strong>Credentials</strong></td>
+<td><strong>Binance key in the execution project's Secret Manager; Binance-side IP whitelist + withdrawal address whitelist</strong></td>
+<td>A stolen key is useless outside the static egress IP and allowlisted addresses</td>
+</tr>
+<tr>
+<td><strong>Audit</strong></td>
+<td><strong>Append-only Cloud Storage bucket with locked retention, in a separate audit project</strong></td>
+<td>Execution and ops admins cannot alter records</td>
+</tr>
+<tr>
+<td><strong>Deploy and policy changes</strong></td>
+<td><strong>Separate pipeline; production deploys and policy changes need your approval</strong></td>
+<td>Build jobs never see production credentials</td>
+</tr>
+<tr>
+<td>Secrets (platform)</td>
+<td>Secret Manager, fetched at boot by each VM's service account</td>
+<td>No key files on disk</td>
+</tr>
+<tr>
+<td>Admin access</td>
+<td>IAP for SSH and admin UIs; OS Login</td>
+<td>No bastion, no admin UI on the internet</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<p>The platform is drawn first, unchanged from v1; the second diagram shows the new execution project and everything that crosses its boundary.</p>
+<h3 id="platform-prj-platform">Platform (<code>prj-platform</code>)</h3>
+<figure><a href="diagram-platform.html"><img src="platform.png" alt="Platform architecture"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
+<p><strong>Request path.</strong> Client → HTTPS 443 on the global LB → Cloud Armor → APISIX on 9080 → app VMs on <code>10.10.2.11</code>–<code>.13:8080</code>. <strong>Telemetry</strong> goes over OTLP to the observability VM; <strong>security events</strong> go to Wazuh on 1514. Cloud NAT and IAP are not drawn.</p>
+<h3 id="execution-boundary-prj-exec-new-in-v2">Execution boundary (<code>prj-exec</code>, new in v2)</h3>
+<figure><a href="diagram-exec.html"><img src="exec-boundary.png" alt="Binance execution service trust boundary"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
+<p><strong>What crosses the boundary:</strong> TMS sends instructions in and reads status (PSC, mTLS); ops browsers reach only the approval origin (IAP + Cloud Armor); the only outbound path for funds is the static-IP egress gateway to Binance. Telemetry and Wazuh events leave through two outbound-only PSC endpoints (not drawn). The audit bucket sits in <code>prj-audit</code>; the execution service can only add objects to it.</p>
+<h2 id="components">Components</h2>
+<p>The platform components are unchanged from v1; the second table lists what v2 adds in <code>prj-exec</code> and <code>prj-audit</code>.</p>
+<p><strong>Platform (<code>prj-platform</code>, as v1)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>GCP resource</th>
+<th>Configuration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public IP + TLS</td>
+<td>Global static IP, Google-managed certificate</td>
+<td>HTTPS 443 only; HTTP redirects to HTTPS; SSL policy <code>MODERN</code>, min TLS 1.2</td>
+</tr>
+<tr>
+<td>Edge LB</td>
+<td>Global external Application LB</td>
+<td>Backend <code>be-apisix</code> → gateway MIG on <code>http:9080</code>; health check <code>/healthz</code>; logging on</td>
+</tr>
+<tr>
+<td>WAF</td>
+<td>Cloud Armor policy <code>waf-edge</code></td>
+<td>Attached to <code>be-apisix</code></td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Regional MIG <code>mig-apisix</code>, 2+ VMs</td>
+<td>APISIX in Docker, standalone mode; <code>jwt-auth</code>/<code>openid-connect</code>, <code>limit-count</code>, <code>cors</code>, <code>request-id</code>, <code>prometheus</code>, <code>opentelemetry</code></td>
+</tr>
+<tr>
+<td>Application (incl. TMS)</td>
+<td>Stateful regional MIG <code>mig-app</code>, fixed IPs <code>10.10.2.11</code>–<code>.13</code></td>
+<td>Docker; image by digest; APISIX upstream with active health checks. <strong>No Binance credentials or Binance code after cutover</strong></td>
+</tr>
+<tr>
+<td>Observability</td>
+<td><code>vm-obs</code> in <code>snet-ops</code></td>
+<td>OTel Collector gateway, Prometheus, Loki, Tempo, Grafana</td>
+</tr>
+<tr>
+<td>Telemetry agent</td>
+<td>OTel Collector on every VM</td>
+<td>OTLP, host and Docker metrics, Docker logs</td>
+</tr>
+<tr>
+<td>SIEM / HIDS</td>
+<td><code>vm-wazuh</code> in <code>snet-ops</code></td>
+<td>Manager, indexer, dashboard; agents everywhere; Pub/Sub feed of Cloud Logging</td>
+</tr>
+<tr>
+<td>Secrets</td>
+<td>Secret Manager</td>
+<td>One secret per credential; accessor IAM per secret</td>
+</tr>
+<tr>
+<td>Images</td>
+<td>Artifact Registry</td>
+<td>Reader per VM service account</td>
+</tr>
+<tr>
+<td>Egress</td>
+<td>Cloud NAT</td>
+<td>Outbound for VMs without public IPs</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Execution (<code>prj-exec</code>, <code>prj-audit</code>, new in v2)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>GCP resource</th>
+<th>Configuration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Execution service</td>
+<td>Regional MIG <code>mig-exec</code>, 2 VMs, fixed size, in <code>vpc-exec</code></td>
+<td>One container: internal API, approval UI, WebAuthn verifier, policy engine, executor, reconciliation worker. Runs as non-root, read-only filesystem</td>
+</tr>
+<tr>
+<td>Approval origin</td>
+<td>Own global external Application LB, certificate for <code>approve.&lt;domain&gt;</code>, Cloud Armor policy <code>waf-approve</code>, IAP</td>
+<td>Ops IP allowlist + OWASP rules; IAP limited to the ops group; only <code>/i/*</code> routes</td>
+</tr>
+<tr>
+<td>Internal API endpoint</td>
+<td>Private Service Connect service attachment (exec) + PSC endpoint in <code>vpc-app</code></td>
+<td>TMS calls a private IP; mTLS with a client certificate issued to TMS</td>
+</tr>
+<tr>
+<td>Execution database</td>
+<td>Cloud SQL for PostgreSQL, private IP only, HA, CMEK optional</td>
+<td>Instructions, approvals, challenges, executions, approvers; point-in-time recovery on</td>
+</tr>
+<tr>
+<td>Binance credentials</td>
+<td>Secret Manager in <code>prj-exec</code></td>
+<td>Only <code>sa-exec</code> can access; Binance-side IP whitelist and withdrawal address whitelist</td>
+</tr>
+<tr>
+<td>Egress gateway</td>
+<td>Cloud NAT with one reserved static IP, plus Cloud NGFW FQDN egress rules (or Secure Web Proxy)</td>
+<td>Only Binance API hostnames, Google APIs through Private Google Access, and the Wazuh/OTel endpoints over PSC</td>
+</tr>
+<tr>
+<td>Audit store</td>
+<td>Cloud Storage bucket in <code>prj-audit</code> with a locked retention policy</td>
+<td>Append-only per-event objects with a hash chain</td>
+</tr>
+<tr>
+<td>Exec registry and deploy</td>
+<td>Artifact Registry + Cloud Deploy in <code>prj-exec</code></td>
+<td>Signed images; production stage needs your approval</td>
+</tr>
+</tbody>
+</table>
+<p><strong>VM image.</strong> One Ubuntu LTS golden image with Docker, the OTel Collector and the Wazuh agent. Execution VMs use a separate hardened variant: no compilers or debug tools, Wazuh active response off.</p>
+<p><strong>Why APISIX standalone.</strong> APISIX reads routes from <code>conf/apisix.yaml</code> and has no Admin API, so there is no etcd and no admin port to protect. Changes ship through CI.</p>
+<p><strong>Scaling the app tier.</strong> The stateful MIG cannot autoscale; adding capacity means a VM with the next fixed IP plus the new node in <code>apisix.yaml</code> in one CI change.</p>
+<h2 id="binance-execution-service">Binance execution service</h2>
+<p>The execution service turns an immutable payment instruction plus verified Passkey approvals into exactly one Binance request, and nothing else can reach the Binance credentials.</p>
+<h3 id="trust-boundary">Trust boundary</h3>
+<table>
+<thead>
+<tr>
+<th>Project</th>
+<th>Holds</th>
+<th>Who has IAM roles</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>prj-platform</code></td>
+<td>Everything from v1: LB, APISIX, app, TMS, observability, Wazuh</td>
+<td>Platform team, <code>sa-deployer</code></td>
+</tr>
+<tr>
+<td><code>prj-exec</code></td>
+<td>Execution VMs, approval LB + Cloud Armor, Cloud SQL, Binance secret, egress gateway, exec Artifact Registry</td>
+<td>You (break-glass), <code>sa-exec</code>, <code>sa-exec-deployer</code>. <strong>No platform roles at all</strong></td>
+</tr>
+<tr>
+<td><code>prj-audit</code></td>
+<td>Locked audit bucket</td>
+<td>You; <code>sa-exec</code> may only create objects</td>
+</tr>
+</tbody>
+</table>
+<p>Put <code>prj-exec</code> and <code>prj-audit</code> in their own folder with organization policies: no service-account key creation, no external IPs on VMs, restricted resource locations.</p>
+<h3 id="payment-instruction">Payment instruction</h3>
+<p>Every execution-relevant field is part of the instruction, and the instruction never changes after creation. A change in TMS creates a new <strong>version</strong>, which voids all approvals of the old one.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Example</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tms_payment_uuid</code></td>
+<td><code>3f6c…e1</code></td>
+<td>From TMS; unique across all executions</td>
+</tr>
+<tr>
+<td><code>version</code></td>
+<td><code>1</code></td>
+<td>Integer, +1 on any change</td>
+</tr>
+<tr>
+<td><code>operation</code></td>
+<td><code>WITHDRAW</code></td>
+<td>From the policy's allowed list</td>
+</tr>
+<tr>
+<td><code>source_account</code></td>
+<td><code>binance-main</code></td>
+<td>Logical name mapped to one Binance account in policy</td>
+</tr>
+<tr>
+<td><code>asset</code></td>
+<td><code>USDT</code></td>
+<td>Upper case</td>
+</tr>
+<tr>
+<td><code>amount</code></td>
+<td><code>"1250.5"</code></td>
+<td>Canonical decimal string: no exponent, no leading <code>+</code> or zeros, no trailing fractional zeros, scale ≤ asset precision</td>
+</tr>
+<tr>
+<td><code>beneficiary_address</code></td>
+<td><code>T…</code></td>
+<td>Exactly as validated for the network; compared byte for byte</td>
+</tr>
+<tr>
+<td><code>network</code></td>
+<td><code>TRX</code></td>
+<td>Binance network code</td>
+</tr>
+<tr>
+<td><code>memo</code></td>
+<td><code>""</code></td>
+<td>Empty string when not applicable, never absent</td>
+</tr>
+<tr>
+<td><code>environment</code></td>
+<td><code>prod</code></td>
+<td>Approval invalid in any other environment</td>
+</tr>
+<tr>
+<td><code>service_id</code></td>
+<td><code>binance-exec</code></td>
+<td>Approval invalid for any other service</td>
+</tr>
+</tbody>
+</table>
+<p>Each approval adds its own fields: <code>approval_nonce</code> (32 random bytes, base64url), <code>approval_expires_at</code> (now + 5 minutes, RFC 3339 UTC), <code>operator_id</code>, <code>instruction_hash</code>.</p>
+<p><strong>Serialization:</strong> JSON Canonicalization Scheme (RFC 8785), UTF-8, all fields present, strings only for amounts. <code>instruction_hash = SHA-256(canonical(instruction))</code>. The WebAuthn challenge is <code>SHA-256(canonical(approval_request))</code>, where the approval request contains <code>instruction_hash</code> plus the approval fields above.</p>
+<h3 id="approval-and-execution-flow">Approval and execution flow</h3>
+<ol>
+<li><strong>Create.</strong> TMS calls <code>POST /v1/instructions</code> over Private Service Connect with mTLS. The service validates fields and policy, stores the instruction and its hash, state <code>PENDING_APPROVAL</code>, and returns the id and hash.</li>
+<li><strong>Review.</strong> The ops approver opens <code>https://approve.&lt;domain&gt;/i/&lt;id&gt;</code>. IAP checks their Google identity and ops group; the page is rendered by the execution service from its own stored instruction, never from TMS data.</li>
+<li><strong>Challenge.</strong> On "Approve", the service creates the approval request, stores the challenge (unused, expires in 5 minutes), and returns it.</li>
+<li><strong>Sign.</strong> The browser calls <code>navigator.credentials.get</code> with that challenge, <code>rpId = approve.&lt;domain&gt;</code>, <code>userVerification: "required"</code>, and only that operator's credential IDs.</li>
+<li><strong>Verify.</strong> The service checks, in one database transaction:
+   - the challenge exists, is unexpired and unused, and is marked used now;
+   - <code>clientDataJSON.type = webauthn.get</code>, challenge matches, origin is exactly <code>https://approve.&lt;domain&gt;</code>;
+   - <code>rpIdHash</code>, user-present and user-verified flags, signature against the stored public key, sign counter increasing when non-zero;
+   - the credential belongs to an active operator whose role allows this operation and amount;
+   - the instruction is still <code>PENDING_APPROVAL</code> at the same version and hash.</li>
+<li><strong>Quorum.</strong> The approval is stored. When policy is met (one approver, or two <strong>distinct</strong> approvers above the threshold), state becomes <code>APPROVED</code>.</li>
+<li><strong>Reserve and send.</strong> The executor sets <code>RESERVED</code> only if the row is <code>APPROVED</code> and no other execution exists for that payment UUID, re-checks daily limits, writes <code>SENDING</code> durably, then calls Binance with <code>withdrawOrderId = tms_payment_uuid</code> (check Binance's length limit).</li>
+<li><strong>Result.</strong> <code>CONFIRMED</code>, <code>FAILED</code> (Binance rejected before acceptance) or <code>UNKNOWN</code> (timeout, 5xx, connection reset). TMS reads <code>GET /v1/instructions/&lt;id&gt;</code>.</li>
+</ol>
+<p>The main backend has no way to say "approved": the API has no such field, and execution starts only from approvals the service verified itself.</p>
+<h3 id="policy">Policy</h3>
+<p>Policy is a YAML file in the execution repo, changed only through your approved pipeline, loaded read-only at start, and its version recorded on every decision.</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Starting point</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allowed operations</td>
+<td><code>WITHDRAW</code> only; add internal transfers explicitly if needed</td>
+</tr>
+<tr>
+<td>Source accounts</td>
+<td>Named list, each mapped to one Binance sub-account</td>
+</tr>
+<tr>
+<td>Destinations</td>
+<td>Allowlist of address + network + memo; mirrored in Binance's withdrawal whitelist</td>
+</tr>
+<tr>
+<td>Per-transaction limit</td>
+<td>Per asset, e.g. USDT 50,000</td>
+</tr>
+<tr>
+<td>Daily limit</td>
+<td>Per asset and source account, counted over <code>RESERVED</code>, <code>SENDING</code>, <code>UNKNOWN</code>, <code>CONFIRMED</code></td>
+</tr>
+<tr>
+<td>Dual approval</td>
+<td>Above a per-asset threshold, two distinct operators on the same instruction version</td>
+</tr>
+<tr>
+<td>Approval TTL</td>
+<td>5 minutes per challenge; instruction expires after 24 hours unapproved</td>
+</tr>
+</tbody>
+</table>
+<h3 id="execution-states">Execution states</h3>
+<p><code>PENDING_APPROVAL → APPROVED → RESERVED → SENDING → CONFIRMED | FAILED | UNKNOWN</code>, plus <code>EXPIRED</code>, <code>SUPERSEDED</code> (new version) and <code>MANUAL_REVIEW</code>.</p>
+<ul>
+<li><code>executions.tms_payment_uuid</code> has a unique constraint; reservation is <code>UPDATE … SET state='RESERVED' WHERE id=$1 AND state='APPROVED'</code> checked for one affected row.</li>
+<li><code>approvals</code> is unique on <code>(instruction_id, version, operator_id)</code>; challenges are consumed with <code>UPDATE … SET used_at=now() WHERE id=$1 AND used_at IS NULL AND expires_at &gt; now()</code>.</li>
+</ul>
+<h3 id="reconciliation-and-restart">Reconciliation and restart</h3>
+<ul>
+<li>On start and every minute, the worker picks up rows in <code>SENDING</code> or <code>UNKNOWN</code> and queries Binance withdrawal history by <code>withdrawOrderId</code>.</li>
+<li>Found → record the Binance id and status, move to <code>CONFIRMED</code> or <code>FAILED</code>. Not found after a 15-minute window → <code>MANUAL_REVIEW</code>. A resend then needs a new instruction version and fresh approvals; the service never resends automatically.</li>
+<li>A crash between "write <code>SENDING</code>" and "record response" therefore always ends in reconciliation, never a blind resend.</li>
+</ul>
+<h3 id="narrow-api">Narrow API</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Endpoints</th>
+<th>Caller</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Internal (PSC + mTLS)</td>
+<td><code>POST /v1/instructions</code>, <code>GET /v1/instructions/{id}</code></td>
+<td>TMS / main backend only</td>
+</tr>
+<tr>
+<td>Approval origin</td>
+<td><code>GET /i/{id}</code>, <code>POST /i/{id}/challenge</code>, <code>POST /i/{id}/assert</code></td>
+<td>Ops browsers through IAP</td>
+</tr>
+<tr>
+<td>Admin</td>
+<td>Enrol, revoke, change role</td>
+<td>You, through IAP on a separate port; never public</td>
+</tr>
+<tr>
+<td>Outbound</td>
+<td>Fixed list of Binance endpoints, hardcoded base URL</td>
+<td>Execution service only</td>
+</tr>
+</tbody>
+</table>
+<p>No pass-through endpoints, no caller-supplied URLs, no generic Binance proxy.</p>
+<h3 id="passkey-administration">Passkey administration</h3>
+<ul>
+<li>Enrolment, replacement, recovery and role changes run only in the admin interface, reached through IAP with your identity and a hardware security key.</li>
+<li>You issue a one-time enrolment code; the operator registers the Passkey on <code>approve.&lt;domain&gt;</code> with user verification required. New approvers and role changes take effect after 24 hours and notify all existing approvers.</li>
+<li>Recovery = revoke the old credential, then enrol again through the same flow. Every step is audited.</li>
+</ul>
+<h3 id="deployment-control">Deployment control</h3>
+<ul>
+<li>Build in CI (GitHub Actions) with no access to <code>prj-exec</code> secrets; sign the image with Cosign; push to the exec Artifact Registry.</li>
+<li>Deploy through a Cloud Deploy pipeline in <code>prj-exec</code> whose production stage requires approval; only you hold <code>roles/clouddeploy.approver</code>.</li>
+<li>The VM startup script verifies the image signature against a pinned public key before running it. Policy files ship the same way.</li>
+</ul>
+<h3 id="audit-trail">Audit trail</h3>
+<ul>
+<li>Records: instruction and hash, policy version and decision, each challenge, each approval (operator, time, verification result), each execution attempt, Binance request id and response, reconciliation results. No secrets, no API signatures.</li>
+<li>Each record is written as its own object to <code>gs://&lt;audit-bucket&gt;</code> in <code>prj-audit</code> before the next state change. The bucket has a locked retention policy; <code>sa-exec</code> has only <code>storage.objectCreator</code>. Each record carries the hash of the previous one, so gaps and edits are detectable.</li>
+<li>A redacted copy goes to Loki and Wazuh for search and alerting.</li>
+</ul>
+<h3 id="acceptance-tests">Acceptance tests</h3>
+<table>
+<thead>
+<tr>
+<th>Must reject or survive</th>
+<th>Test</th>
+<th>Expected</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Modified details after approval</td>
+<td>Change amount in TMS after approval</td>
+<td>New version; old approvals void; nothing sent</td>
+</tr>
+<tr>
+<td>Expired approval</td>
+<td>Sign after 5 minutes</td>
+<td>Rejected, audited</td>
+</tr>
+<tr>
+<td>Replayed approval</td>
+<td>Resend a valid assertion</td>
+<td>Rejected: challenge already used</td>
+</tr>
+<tr>
+<td>Unauthorized approval</td>
+<td>Revoked operator, or role below amount</td>
+<td>Rejected</td>
+</tr>
+<tr>
+<td>Duplicate or concurrent execution</td>
+<td>Two executors and repeated calls on one payment UUID</td>
+<td>Exactly one Binance request</td>
+</tr>
+<tr>
+<td>Threshold bypass</td>
+<td>Above-threshold payment approved once, or twice by one operator</td>
+<td>Stays <code>PENDING_APPROVAL</code></td>
+</tr>
+<tr>
+<td>Policy limit</td>
+<td>Amount above per-transaction or daily limit, or non-allowlisted address</td>
+<td>Rejected at create and again at reserve</td>
+</tr>
+<tr>
+<td>Approval flag only</td>
+<td>Backend sends <code>approved=true</code></td>
+<td>Rejected: unknown field, no execution</td>
+</tr>
+<tr>
+<td>Timeout</td>
+<td>Binance mock delays past client timeout, then accepts</td>
+<td><code>UNKNOWN</code> → reconciled to <code>CONFIRMED</code>; no second request</td>
+</tr>
+<tr>
+<td>Restart</td>
+<td>Kill the service after <code>SENDING</code></td>
+<td>On restart reconciled; no resend</td>
+</tr>
+</tbody>
+</table>
+<h2 id="observability-and-security-monitoring">Observability and security monitoring</h2>
+<p>One OpenTelemetry pipeline carries all three signals to self-hosted backends, and Wazuh watches every host, including the execution VMs; both stacks live in <code>snet-ops</code>, and execution VMs reach them only through two Private Service Connect endpoints.</p>
+<h3 id="signal-flow">Signal flow</h3>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Source</th>
+<th>Collected by</th>
+<th>Stored in</th>
+<th>Retention (starting point)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Traces</td>
+<td>APISIX <code>opentelemetry</code> plugin, app OTel SDK, execution service OTel SDK</td>
+<td>OTLP → local collector → gateway collector (tail sampling: keep errors + slow, 10% of the rest)</td>
+<td>Tempo, GCS bucket <code>PROJECT-tempo</code></td>
+<td>14 days</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>APISIX <code>prometheus</code> plugin, app and execution <code>/metrics</code>, <code>hostmetrics</code>, <code>docker_stats</code></td>
+<td>Local collector scrapes → gateway collector → Prometheus remote write</td>
+<td>Prometheus, SSD persistent disk</td>
+<td>30 days</td>
+</tr>
+<tr>
+<td>Logs</td>
+<td>Docker JSON logs, syslog</td>
+<td>Local collector <code>filelog</code> → gateway collector → Loki OTLP endpoint</td>
+<td>Loki, GCS bucket <code>PROJECT-loki</code></td>
+<td>30 days</td>
+</tr>
+<tr>
+<td>Cloud logs</td>
+<td>LB, Cloud Armor, audit logs (both projects)</td>
+<td>Cloud Logging; Grafana's Google Cloud Logging data source</td>
+<td>Cloud Logging</td>
+<td>per log bucket</td>
+</tr>
+<tr>
+<td>Security events</td>
+<td>Wazuh agents; Cloud Logging of both projects via Pub/Sub</td>
+<td>Wazuh manager</td>
+<td>Wazuh indexer</td>
+<td>90 days hot, then snapshot to GCS</td>
+</tr>
+<tr>
+<td><strong>Execution audit</strong></td>
+<td>Execution service</td>
+<td>Written directly by the service</td>
+<td><strong>Locked bucket in <code>prj-audit</code></strong> (system of record); redacted copy in Loki and Wazuh</td>
+<td>Per your audit requirement, e.g. 7 years</td>
+</tr>
+</tbody>
+</table>
+<p>APISIX writes the trace ID into its access log (<code>opentelemetry</code> plugin with <code>set_ngx_var: true</code>), so Grafana jumps from a Tempo trace to its Loki log lines and back.</p>
+<p><strong>Execution service telemetry rules:</strong> never log or trace request bodies to Binance, signatures, API keys, WebAuthn assertions or full addresses (log the instruction hash and a masked address). Spans carry the instruction id, state and policy decision only.</p>
+<h3 id="observability-vm-vm-obs">Observability VM (<code>vm-obs</code>)</h3>
+<ul>
+<li>e2-standard-4 to start; Docker Compose runs <code>otel-collector-contrib</code>, <code>prometheus</code> (with <code>--web.enable-remote-write-receiver</code>), <code>loki</code> (GCS backend), <code>tempo</code> (GCS backend, metrics-generator) and <code>grafana</code>.</li>
+<li>Grafana data sources: Prometheus, Loki, Tempo (trace-to-logs and trace-to-metrics on), Google Cloud Monitoring and Logging.</li>
+<li>Grafana admin password and OIDC client secret come from Secret Manager at boot.</li>
+<li>Reached only through IAP: <code>gcloud compute start-iap-tunnel vm-obs 3000 --local-host-port=localhost:3000</code>.</li>
+<li>The OTel gateway is also published through an internal passthrough NLB and a PSC service attachment that accepts only <code>prj-exec</code>.</li>
+</ul>
+<h3 id="wazuh-vm-vm-wazuh">Wazuh VM (<code>vm-wazuh</code>)</h3>
+<ul>
+<li>Official <code>wazuh-docker</code> single-node deployment. Start at 4 vCPU / 16 GB RAM and a 200 GB SSD disk. Set <code>vm.max_map_count=262144</code> for the indexer.</li>
+<li>Agents are baked into the golden image and enrol with <code>wazuh-enrollment-password</code> from Secret Manager; manager <code>10.10.3.20</code>, ports 1515 and 1514. Execution VMs reach the manager through their own PSC endpoint and use a <strong>separate enrolment password stored in <code>prj-exec</code></strong>.</li>
+<li>Turn on FIM for <code>/etc</code>, <code>/opt/apisix</code>, <code>/opt/exec</code>, Docker configs; SCA with the CIS Ubuntu benchmark; vulnerability detection; Docker listener; log analysis.</li>
+<li><strong>On execution VMs: active response off and remote commands off</strong> (<code>w``azuh_command.remote_commands=0 and sca.remote_commands=0 in local_internal_options.conf</code>), so a compromised Wazuh manager cannot run commands there.</li>
+<li>GCP feed: Cloud Logging sinks from both projects to Pub/Sub; the <code>gcp-pubsub</code> module pulls with the one keyed service account (subscriber-only, key in Secret Manager, rotated every 90 days).</li>
+<li>Execution-specific rules: approver added or role changed, policy version changed, execution reaching <code>UNKNOWN</code> or <code>MANUAL_REVIEW</code>, rejected approvals above 3 in 10 minutes, any Secret Manager access to the Binance secret by an identity other than <code>sa-exec</code>.</li>
+<li>Dashboard reached only through IAP on port 443.</li>
+</ul>
+<h2 id="network-design">Network design</h2>
+<p>Two VPCs with no peering and no shared routes: <code>vpc-app</code> (v1) and <code>vpc-exec</code> (v2). They connect only through three Private Service Connect endpoints, each a single IP and port.</p>
+<table>
+<thead>
+<tr>
+<th>VPC</th>
+<th>Subnet</th>
+<th>Example CIDR</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vpc-app</code></td>
+<td><code>snet-gateway</code></td>
+<td>10.10.1.0/24</td>
+<td>APISIX VMs</td>
+</tr>
+<tr>
+<td><code>vpc-app</code></td>
+<td><code>snet-app</code></td>
+<td>10.10.2.0/24</td>
+<td>App and TMS VMs at fixed IPs; PSC endpoint to exec API at <code>10.10.2.50</code></td>
+</tr>
+<tr>
+<td><code>vpc-app</code></td>
+<td><code>snet-ops</code></td>
+<td>10.10.3.0/24</td>
+<td><code>vm-obs</code> (<code>.10</code>), <code>vm-wazuh</code> (<code>.20</code>), internal NLBs for the two PSC services published to exec</td>
+</tr>
+<tr>
+<td><code>vpc-app</code></td>
+<td><code>snet-ops-psc</code></td>
+<td>10.10.9.0/28</td>
+<td>PSC NAT subnet for the obs and Wazuh service attachments</td>
+</tr>
+<tr>
+<td><code>vpc-exec</code></td>
+<td><code>snet-exec</code></td>
+<td>10.20.1.0/24</td>
+<td>Execution VMs, internal NLB for the exec API service attachment, PSC endpoints to OTel (<code>10.20.1.60</code>) and Wazuh (<code>10.20.1.61</code>)</td>
+</tr>
+<tr>
+<td><code>vpc-exec</code></td>
+<td><code>snet-exec-psc</code></td>
+<td>10.20.9.0/28</td>
+<td>PSC NAT subnet for the exec service attachment</td>
+</tr>
+<tr>
+<td><code>vpc-exec</code></td>
+<td>Cloud SQL private services range</td>
+<td>10.20.16.0/20</td>
+<td>Cloud SQL private IP</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Private Service Connect</strong></p>
+<table>
+<thead>
+<tr>
+<th>Direction</th>
+<th>Consumer endpoint</th>
+<th>Producer</th>
+<th>Port</th>
+<th>Accepts</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TMS → execution API</td>
+<td><code>10.10.2.50</code> in <code>vpc-app</code></td>
+<td>Service attachment on exec internal NLB</td>
+<td>tcp:8443 (mTLS)</td>
+<td><code>prj-platform</code> only</td>
+</tr>
+<tr>
+<td>Exec → OTel gateway</td>
+<td><code>10.20.1.60</code> in <code>vpc-exec</code></td>
+<td>Service attachment on NLB in front of <code>vm-obs</code></td>
+<td>tcp:4317</td>
+<td><code>prj-exec</code> only</td>
+</tr>
+<tr>
+<td>Exec → Wazuh manager</td>
+<td><code>10.20.1.61</code> in <code>vpc-exec</code></td>
+<td>Service attachment on NLB in front of <code>vm-wazuh</code></td>
+<td>tcp:1514, 1515</td>
+<td><code>prj-exec</code> only</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Firewall rules, <code>vpc-app</code></strong> (as v1, plus the PSC sources):</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Source</th>
+<th>Target</th>
+<th>Port</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow-glb-to-apisix</code></td>
+<td>35.191.0.0/16, 130.211.0.0/22</td>
+<td><code>sa-apisix</code></td>
+<td>tcp:9080</td>
+</tr>
+<tr>
+<td><code>allow-apisix-to-app</code></td>
+<td><code>sa-apisix</code></td>
+<td><code>sa-app</code></td>
+<td>tcp:8080</td>
+</tr>
+<tr>
+<td><code>allow-hc-to-app</code></td>
+<td>35.191.0.0/16, 130.211.0.0/22</td>
+<td><code>sa-app</code></td>
+<td>tcp:8080</td>
+</tr>
+<tr>
+<td><code>allow-otlp-to-obs</code></td>
+<td><code>sa-apisix</code>, <code>sa-app</code>, <code>sa-wazuh</code>; 10.10.9.0/28 (PSC NAT)</td>
+<td><code>sa-obs</code></td>
+<td>tcp:4317, 4318</td>
+</tr>
+<tr>
+<td><code>allow-agents-to-wazuh</code></td>
+<td><code>sa-apisix</code>, <code>sa-app</code>, <code>sa-obs</code>; 10.10.9.0/28 (PSC NAT)</td>
+<td><code>sa-wazuh</code></td>
+<td>tcp:1514, 1515</td>
+</tr>
+<tr>
+<td><code>allow-iap-admin</code></td>
+<td>35.235.240.0/20</td>
+<td>all VMs</td>
+<td>tcp:22; tcp:3000 on <code>sa-obs</code>; tcp:443 on <code>sa-wazuh</code></td>
+</tr>
+<tr>
+<td><code>deny-all-ingress</code></td>
+<td>0.0.0.0/0</td>
+<td>all</td>
+<td>all, lowest priority</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Firewall rules, <code>vpc-exec</code></strong> (deny by default in both directions):</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Direction</th>
+<th>Source / destination</th>
+<th>Target</th>
+<th>Port</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow-glb-to-exec-ui</code></td>
+<td>Ingress</td>
+<td>35.191.0.0/16, 130.211.0.0/22</td>
+<td><code>sa-exec</code></td>
+<td>tcp:8080 (approval UI)</td>
+</tr>
+<tr>
+<td><code>allow-psc-to-exec-api</code></td>
+<td>Ingress</td>
+<td>10.20.9.0/28 (PSC NAT)</td>
+<td><code>sa-exec</code></td>
+<td>tcp:8443</td>
+</tr>
+<tr>
+<td><code>allow-hc-to-exec</code></td>
+<td>Ingress</td>
+<td>35.191.0.0/16, 130.211.0.0/22</td>
+<td><code>sa-exec</code></td>
+<td>tcp:8080, 8443</td>
+</tr>
+<tr>
+<td><code>allow-iap-ssh-exec</code></td>
+<td>Ingress</td>
+<td>35.235.240.0/20</td>
+<td><code>sa-exec</code></td>
+<td>tcp:22 (break-glass; IAP role held by you only)</td>
+</tr>
+<tr>
+<td><code>deny-all-ingress</code></td>
+<td>Ingress</td>
+<td>0.0.0.0/0</td>
+<td>all</td>
+<td>all</td>
+</tr>
+<tr>
+<td><code>allow-egress-binance</code></td>
+<td>Egress</td>
+<td>FQDN objects for the Binance API hostnames you use</td>
+<td><code>sa-exec</code></td>
+<td>tcp:443</td>
+</tr>
+<tr>
+<td><code>allow-egress-google-apis</code></td>
+<td>Egress</td>
+<td><code>private.googleapis.com</code> (199.36.153.8/30)</td>
+<td><code>sa-exec</code></td>
+<td>tcp:443</td>
+</tr>
+<tr>
+<td><code>allow-egress-internal</code></td>
+<td>Egress</td>
+<td>10.20.1.60, 10.20.1.61, Cloud SQL range</td>
+<td><code>sa-exec</code></td>
+<td>tcp:4317, 1514, 1515, 5432</td>
+</tr>
+<tr>
+<td><code>deny-all-egress</code></td>
+<td>Egress</td>
+<td>0.0.0.0/0</td>
+<td>all</td>
+<td>all, lowest priority</td>
+</tr>
+</tbody>
+</table>
+<p>FQDN egress objects need a Cloud NGFW network firewall policy. If you prefer an explicit proxy, Secure Web Proxy with a hostname allowlist gives the same result.</p>
+<p><strong>Egress IP.</strong> <code>vpc-exec</code> has its own Cloud NAT with <strong>one manually reserved static IP</strong>. Register that IP in the Binance API key's IP whitelist; a stolen key then fails from anywhere else.</p>
+<p><strong>Target rules by service account</strong>, not network tag: only users with <code>iam.serviceAccountUser</code> can attach a service account.</p>
+<h2 id="security-design">Security design</h2>
+<p>Security is layered: Cloud Armor filters at Google's edge, APISIX authenticates and throttles per consumer, IAM limits each VM to the secrets and images it needs, and fund movement sits behind a separate project boundary that only you administer.</p>
+<h3 id="cloud-armor-policy-waf-edge-main-api">Cloud Armor policy <code>waf-edge</code> (main API)</h3>
+<p>Start every WAF rule in <strong>preview mode</strong> for about a week, review the logs for false positives, then switch to enforce.</p>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Rule</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100</td>
+<td>Allowlist: office / partner CIDRs (optional)</td>
+<td>allow</td>
+</tr>
+<tr>
+<td>200</td>
+<td>Denylist: known bad IPs, or geo block with <code>origin.region_code</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1000</td>
+<td><code>evaluatePreconfiguredWaf('sqli-v33-stable', {'sensitivity': 1})</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1010</td>
+<td><code>xss-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1020</td>
+<td><code>lfi-v33-stable</code>, <code>rfi-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1030</td>
+<td><code>rce-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1040</td>
+<td><code>methodenforcement-v33-stable</code>, <code>protocolattack-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1050</td>
+<td><code>scannerdetection-v33-stable</code>, <code>sessionfixation-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>2000</td>
+<td>Rate-based ban per client IP (for example 600 requests / 60 s, ban 300 s)</td>
+<td>rate_based_ban, 429</td>
+</tr>
+<tr>
+<td>2147483647</td>
+<td>Default</td>
+<td>allow</td>
+</tr>
+</tbody>
+</table>
+<p>Also turn on <strong>Adaptive Protection</strong> and set <code>--json-parsing=STANDARD</code>. Begin at sensitivity 1 and raise it only after tuning.</p>
+<h3 id="cloud-armor-policy-waf-approve-approval-origin">Cloud Armor policy <code>waf-approve</code> (approval origin)</h3>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Rule</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>50–90</td>
+<td>The same preconfigured WAF rules as <code>waf-edge</code>, enforced from day one</td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>100</td>
+<td>Source IP in the ops allowlist (<code>inIpRange(origin.ip, '…')</code>), rate limited to 60 requests / 60 s per IP</td>
+<td>throttle: conform = allow, exceed = deny(429)</td>
+</tr>
+<tr>
+<td>2147483647</td>
+<td>Default</td>
+<td>deny(403)</td>
+</tr>
+</tbody>
+</table>
+<p>IAP on the approval backend adds a Google identity check for the ops group before the page loads; the Passkey assertion is then the approval itself.</p>
+<h3 id="tls">TLS</h3>
+<ul>
+<li>Client to LBs: Google-managed certificates, SSL policy <code>MODERN</code>, minimum TLS 1.2, HSTS on <code>approve.&lt;domain&gt;</code>.</li>
+<li>TMS to execution API: mTLS over PSC. The service accepts only the TMS client certificate (issued from a private CA in <code>prj-exec</code>).</li>
+<li>LB to APISIX and APISIX to app: HTTP inside the VPC is acceptable for many workloads; switch to HTTPS if your regulator requires encryption in transit inside the VPC.</li>
+<li>Execution service to Cloud SQL: TLS with <code>sslmode=verify-full</code> or the Cloud SQL Auth Proxy.</li>
+<li>Telemetry and Wazuh: TLS on the OTLP receiver; Wazuh agent traffic is encrypted by default.</li>
+</ul>
+<h3 id="identity-and-iam">Identity and IAM</h3>
+<table>
+<thead>
+<tr>
+<th>Service account</th>
+<th>Project</th>
+<th>Roles (granted on the narrowest resource)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sa-apisix</code></td>
+<td>platform</td>
+<td><code>secretmanager.secretAccessor</code> on gateway secrets + <code>wazuh-enrollment-password</code>; <code>artifactregistry.reader</code>; <code>storage.objectViewer</code> on the config bucket</td>
+</tr>
+<tr>
+<td><code>sa-app</code></td>
+<td>platform</td>
+<td><code>secretmanager.secretAccessor</code> on app secrets + <code>wazuh-enrollment-password</code>; <code>artifactregistry.reader</code>. <strong>No Binance secret</strong></td>
+</tr>
+<tr>
+<td><code>sa-obs</code></td>
+<td>platform</td>
+<td><code>storage.objectAdmin</code> on Loki and Tempo buckets; Grafana secrets; <code>monitoring.viewer</code>, <code>logging.viewer</code></td>
+</tr>
+<tr>
+<td><code>sa-wazuh</code></td>
+<td>platform</td>
+<td>Wazuh secrets; <code>storage.objectAdmin</code> on the Wazuh snapshot bucket</td>
+</tr>
+<tr>
+<td><code>sa-wazuh-pubsub</code> (keyed)</td>
+<td>platform</td>
+<td><code>pubsub.subscriber</code> on the Wazuh subscription only</td>
+</tr>
+<tr>
+<td><code>sa-deployer</code></td>
+<td>platform</td>
+<td><code>compute.instanceAdmin.v1</code>, <code>iam.serviceAccountUser</code> on platform VM accounts, <code>artifactregistry.writer</code>. <strong>No role in <code>prj-exec</code></strong></td>
+</tr>
+<tr>
+<td><code>sa-exec</code></td>
+<td>exec</td>
+<td><code>secretmanager.secretAccessor</code> on <code>binance-api-key</code>, <code>binance-api-secret</code>, <code>exec-mtls-key</code>, exec Wazuh password; <code>cloudsql.client</code>; <code>artifactregistry.reader</code> on the exec repo; <code>storage.objectCreator</code> on the audit bucket only</td>
+</tr>
+<tr>
+<td><code>sa-exec-deployer</code></td>
+<td>exec</td>
+<td><code>clouddeploy.releaser</code>, <code>compute.instanceAdmin.v1</code> on <code>mig-exec</code>, <code>iam.serviceAccountUser</code> on <code>sa-exec</code>, <code>artifactregistry.writer</code> on the exec repo. <strong>No Secret Manager access</strong></td>
+</tr>
+<tr>
+<td>You</td>
+<td>exec, audit</td>
+<td>Owner through a break-glass group with MFA; <code>clouddeploy.approver</code>; IAP access to the admin UI</td>
+</tr>
+</tbody>
+</table>
+<p>No service-account key files except the Wazuh Pub/Sub reader. Organization policy <code>iam.disableServiceAccountKeyCreation</code> is enforced on the exec folder. Humans reach VMs through IAP + OS Login.</p>
+<h3 id="secret-handling">Secret handling</h3>
+<ol>
+<li>Store each credential as its own secret, regional replication in the deployment region.</li>
+<li>At boot, a startup script reads the secrets with the VM's identity and writes them to a <code>tmpfs</code> file readable only by the container user.</li>
+<li>Docker gets them as an env file or a mounted file; APISIX references them as <code>$ENV://NAME</code>, so no secret value is stored in Git.</li>
+<li>Rotation = add a new secret version, then roll the MIG.</li>
+<li><strong>Binance key:</strong> created by you in Binance with only the permissions needed (enable withdrawals; no trading, no futures, no universal transfer unless required), restricted to the exec static egress IP, with Binance's withdrawal address whitelist on. Rotate it at cutover and every 90 days; old keys from the main app are deleted in Binance.</li>
+</ol>
+<h3 id="vm-hardening">VM hardening</h3>
+<ul>
+<li>Shielded VM (Secure Boot, vTPM, integrity monitoring); OS Login on; serial port off; project-wide SSH keys blocked.</li>
+<li>Containers run as a non-root user, read-only root filesystem, <code>no-new-privileges</code>, only needed ports published.</li>
+<li>Images pinned by digest; Artifact Registry vulnerability scanning on.</li>
+<li>Execution VMs: separate minimal image, signature check at boot, no SSH except break-glass, no package managers reachable (egress denied).</li>
+</ul>
+<h2 id="implementation-steps">Implementation steps</h2>
+<p>Build the platform exactly as v1 (steps 1–13), then the execution boundary (steps 14–22); cut over only after the acceptance tests pass.</p>
+<p><strong>Steps 1–13 (platform):</strong> unchanged from v1 — APIs, VPC, service accounts and firewall, Artifact Registry, secrets, APISIX, gateway MIG, app MIG, observability VM, Wazuh, Cloud Armor, external LB, DNS and checks. See the <a href="https://vika-researchpersonal.github.io/design-mausbot/gcp-platform/#implementation-steps">v1 implementation steps</a>.</p>
+<p>Extra variables for steps 14–22:</p>
+<pre><code class="language-bash">export ORG_ID=&lt;org-id&gt; PLATFORM_PROJECT=$PROJECT_ID EXEC_PROJECT=&lt;exec-project&gt; AUDIT_PROJECT=&lt;audit-project&gt;
+export SA_EXEC=sa-exec@${EXEC_PROJECT}.iam.gserviceaccount.com
+export APPROVE_DOMAIN=approve.example.com
+</code></pre>
+<h3 id="14-folder-projects-and-organization-policies">14. Folder, projects and organization policies</h3>
+<pre><code class="language-bash">gcloud resource-manager folders create --display-name=funds-execution --organization=$ORG_ID
+gcloud projects create $EXEC_PROJECT  --folder=&lt;folder-id&gt;
+gcloud projects create $AUDIT_PROJECT --folder=&lt;folder-id&gt;
+gcloud resource-manager org-policies enable-enforce iam.disableServiceAccountKeyCreation --folder=&lt;folder-id&gt;
+# also set: compute.vmExternalIpAccess = deny all, gcp.resourceLocations = your region
+gcloud services enable compute.googleapis.com sqladmin.googleapis.com secretmanager.googleapis.com \
+  artifactregistry.googleapis.com clouddeploy.googleapis.com iap.googleapis.com \
+  servicenetworking.googleapis.com privateca.googleapis.com --project=$EXEC_PROJECT
+</code></pre>
+<p>Grant project roles in <code>prj-exec</code> and <code>prj-audit</code> only to a break-glass group containing you. Nobody from the platform team.</p>
+<h3 id="15-execution-network-and-egress">15. Execution network and egress</h3>
+<pre><code class="language-bash">P=&quot;--project=$EXEC_PROJECT&quot;
+gcloud compute networks create vpc-exec --subnet-mode=custom $P
+gcloud compute networks subnets create snet-exec --network=vpc-exec --region=$REGION \
+  --range=10.20.1.0/24 --enable-private-ip-google-access $P
+gcloud compute networks subnets create snet-exec-psc --network=vpc-exec --region=$REGION \
+  --range=10.20.9.0/28 --purpose=PRIVATE_SERVICE_CONNECT $P
+
+# one static egress IP, registered in Binance
+gcloud compute addresses create ip-exec-egress --region=$REGION $P
+gcloud compute routers create rtr-exec --network=vpc-exec --region=$REGION $P
+gcloud compute routers nats create nat-exec --router=rtr-exec --region=$REGION \
+  --nat-external-ip-pool=ip-exec-egress --nat-all-subnet-ip-ranges $P
+
+# egress allowlist by FQDN (Cloud NGFW network firewall policy)
+gcloud compute network-firewall-policies create fwp-exec --global $P
+gcloud compute network-firewall-policies rules create 1000 --firewall-policy=fwp-exec \
+  --global-firewall-policy --direction=EGRESS --action=allow --layer4-configs=tcp:443 \
+  --dest-fqdns=api.binance.com --target-service-accounts=$SA_EXEC $P
+gcloud compute network-firewall-policies rules create 65000 --firewall-policy=fwp-exec \
+  --global-firewall-policy --direction=EGRESS --action=deny --layer4-configs=all \
+  --dest-ip-ranges=0.0.0.0/0 $P
+gcloud compute network-firewall-policies associations create --firewall-policy=fwp-exec \
+  --network=vpc-exec --global-firewall-policy $P
+</code></pre>
+<p>Add the remaining allow rules from the <code>vpc-exec</code> table in Network design (Google APIs, Cloud SQL, PSC endpoints, ingress from GFE, PSC NAT and IAP) to the same policy at priorities below 65000.</p>
+<h3 id="16-database-secrets-audit-bucket">16. Database, secrets, audit bucket</h3>
+<pre><code class="language-bash">gcloud compute addresses create psa-exec --global --purpose=VPC_PEERING \
+  --addresses=10.20.16.0 --prefix-length=20 --network=vpc-exec $P
+gcloud services vpc-peerings connect --service=servicenetworking.googleapis.com \
+  --ranges=psa-exec --network=vpc-exec $P
+gcloud sql instances create sql-exec --database-version=POSTGRES_16 --region=$REGION \
+  --tier=db-custom-2-7680 --availability-type=REGIONAL --no-assign-ip \
+  --network=projects/$EXEC_PROJECT/global/networks/vpc-exec \
+  --enable-point-in-time-recovery --ssl-mode=ENCRYPTED_ONLY $P
+
+# Binance credentials: entered by you, from your own workstation
+for S in binance-api-key binance-api-secret; do
+  gcloud secrets create $S --replication-policy=user-managed --locations=$REGION $P
+  gcloud secrets add-iam-policy-binding $S --member=serviceAccount:$SA_EXEC \
+    --role=roles/secretmanager.secretAccessor $P
+done
+
+# append-only audit bucket
+gcloud storage buckets create gs://${AUDIT_PROJECT}-exec-audit --project=$AUDIT_PROJECT \
+  --location=$REGION --uniform-bucket-level-access --retention-period=2557d
+gcloud storage buckets add-iam-policy-binding gs://${AUDIT_PROJECT}-exec-audit \
+  --member=serviceAccount:$SA_EXEC --role=roles/storage.objectCreator
+# after a test period, lock it (irreversible):
+gcloud storage buckets update gs://${AUDIT_PROJECT}-exec-audit --lock-retention-period
+</code></pre>
+<h3 id="17-private-service-connect-wiring">17. Private Service Connect wiring</h3>
+<pre><code class="language-bash"># exec publishes its internal API (producer)
+gcloud compute health-checks create tcp hc-exec-api --region=$REGION --port=8443 $P
+gcloud compute backend-services create be-exec-api --region=$REGION --load-balancing-scheme=INTERNAL \
+  --protocol=TCP --health-checks=hc-exec-api --health-checks-region=$REGION $P
+gcloud compute backend-services add-backend be-exec-api --region=$REGION \
+  --instance-group=mig-exec --instance-group-region=$REGION $P
+gcloud compute forwarding-rules create fr-exec-api --region=$REGION --load-balancing-scheme=INTERNAL \
+  --network=vpc-exec --subnet=snet-exec --ports=8443 --backend-service=be-exec-api $P
+gcloud compute service-attachments create att-exec-api --region=$REGION \
+  --producer-forwarding-rule=fr-exec-api --connection-preference=ACCEPT_MANUAL \
+  --consumer-accept-list=$PLATFORM_PROJECT=1 --nat-subnets=snet-exec-psc $P
+
+# platform consumes it at 10.10.2.50
+gcloud compute addresses create ip-exec-api --region=$REGION --subnet=snet-app \
+  --addresses=10.10.2.50 --project=$PLATFORM_PROJECT
+gcloud compute forwarding-rules create psc-exec-api --region=$REGION --network=vpc-app \
+  --address=ip-exec-api --project=$PLATFORM_PROJECT \
+  --target-service-attachment=projects/$EXEC_PROJECT/regions/$REGION/serviceAttachments/att-exec-api
+</code></pre>
+<p>Mirror this for telemetry: in <code>prj-platform</code>, put internal passthrough NLBs in front of <code>vm-obs</code> (4317) and <code>vm-wazuh</code> (1514, 1515), publish them as service attachments accepting only <code>$EXEC_PROJECT</code>, and create consumer endpoints <code>10.20.1.60</code> and <code>10.20.1.61</code> in <code>vpc-exec</code>.</p>
+<h3 id="18-approval-origin">18. Approval origin</h3>
+<p>Create a global external Application LB in <code>prj-exec</code> exactly like v1 step 12, with these differences: certificate for <code>$APPROVE_DOMAIN</code>, backend <code>be-exec-ui</code> on <code>mig-exec</code> named port <code>ui:8080</code>, security policy <code>waf-approve</code>, and IAP on.</p>
+<pre><code class="language-bash">gcloud compute backend-services update be-exec-ui --global --iap=enabled $P
+gcloud iap web add-iam-policy-binding --resource-type=backend-services --service=be-exec-ui \
+  --member=group:ops-approvers@&lt;domain&gt; --role=roles/iap.httpsResourceAccessor $P
+</code></pre>
+<h3 id="19-build-and-deploy-pipeline">19. Build and deploy pipeline</h3>
+<ul>
+<li>New repository (or protected directory) <code>binance-exec</code>, with branch protection and you as required reviewer for <code>policy/</code> and <code>deploy/</code>.</li>
+<li>GitHub Actions authenticates to <code>prj-exec</code> through Workload Identity Federation as a build identity that can only push to the exec Artifact Registry. It signs the image with Cosign.</li>
+<li>Cloud Deploy pipeline in <code>prj-exec</code> with a custom target that rolls <code>mig-exec</code> to a new instance template; the <code>prod</code> target has <code>requireApproval: true</code>, and only you hold <code>roles/clouddeploy.approver</code>.</li>
+<li>The exec startup script verifies the image signature with <code>cosign verify --key &lt;pinned-public-key&gt;</code> before <code>docker run</code>; on failure the VM does not start the service and alerts.</li>
+</ul>
+<h3 id="20-build-the-service">20. Build the service</h3>
+<p>Modules: canonicalizer (RFC 8785), instruction store, WebAuthn verifier (py_webauthn, SimpleWebAuthn server or webauthn4j), policy engine, approval UI, executor, Binance client (fixed endpoints), reconciliation worker, audit writer, admin UI. Core schema:</p>
+<pre><code class="language-sql">CREATE TABLE instructions (
+  id uuid PRIMARY KEY,
+  tms_payment_uuid uuid NOT NULL,
+  version int NOT NULL,
+  canonical_json bytea NOT NULL,
+  instruction_hash bytea NOT NULL,
+  state text NOT NULL,
+  policy_version text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tms_payment_uuid, version)
+);
+CREATE TABLE challenges (
+  id uuid PRIMARY KEY,
+  instruction_id uuid NOT NULL REFERENCES instructions,
+  operator_id uuid NOT NULL,
+  approval_request bytea NOT NULL,
+  challenge bytea NOT NULL UNIQUE,
+  expires_at timestamptz NOT NULL,
+  used_at timestamptz
+);
+CREATE TABLE approvals (
+  instruction_id uuid NOT NULL REFERENCES instructions,
+  operator_id uuid NOT NULL,
+  credential_id bytea NOT NULL,
+  challenge_id uuid NOT NULL UNIQUE REFERENCES challenges,
+  verified_at timestamptz NOT NULL,
+  PRIMARY KEY (instruction_id, operator_id)
+);
+CREATE TABLE executions (
+  tms_payment_uuid uuid PRIMARY KEY,          -- one execution per payment, ever
+  instruction_id uuid NOT NULL REFERENCES instructions,
+  state text NOT NULL,
+  withdraw_order_id text NOT NULL UNIQUE,
+  binance_id text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+</code></pre>
+<p>The application database user has no <code>DELETE</code> on these tables and no <code>UPDATE</code> on <code>instructions.canonical_json</code> or <code>instruction_hash</code> (column-level grants).</p>
+<h3 id="21-binance-key-and-cutover">21. Binance key and cutover</h3>
+<ol>
+<li>In Binance, create a new API key for the funding sub-account: withdrawals only, IP restricted to <code>ip-exec-egress</code>, withdrawal address whitelist on with the policy's destinations.</li>
+<li>Store it in <code>prj-exec</code> Secret Manager; deploy the service; run the acceptance tests against Binance's test environment or a mock, then one small real withdrawal with dual approval.</li>
+<li>Switch TMS to <code>POST /v1/instructions</code> on <code>10.10.2.50:8443</code>.</li>
+<li>Remove the old Binance code paths and configuration from the main backend; delete the old Binance secrets from <code>prj-platform</code>.</li>
+<li>Delete every old Binance API key in Binance. Confirm in Binance's API management page that only the new key exists.</li>
+</ol>
+<h3 id="22-acceptance-run">22. Acceptance run</h3>
+<p>Run the acceptance test table from the Binance execution service section in CI on every exec release, and once manually in production with small amounts. Keep the run report and the matching audit records as evidence.</p>
+<h2 id="operations">Operations</h2>
+<p>Every change ships as a new instance template rolled through its MIG; execution-service changes additionally need your approval in Cloud Deploy.</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Practice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Deploy app</td>
+<td>CI builds image → Artifact Registry → <code>tpl-app-vN</code> → <code>rolling-action start-update mig-app --max-surge=0 --max-unavailable=1</code></td>
+</tr>
+<tr>
+<td>Deploy gateway config</td>
+<td>CI validates <code>apisix.yaml</code>, uploads to the bucket, <code>rolling-action replace mig-apisix</code></td>
+</tr>
+<tr>
+<td><strong>Deploy execution service</strong></td>
+<td>Signed image → Cloud Deploy release → your approval → rolling update of <code>mig-exec</code>, one VM at a time; the executor drains (finishes <code>SENDING</code>, stops taking new reservations) before shutdown</td>
+</tr>
+<tr>
+<td><strong>Change policy</strong></td>
+<td>Pull request to <code>policy/</code> with you as required reviewer → same Cloud Deploy pipeline; the new policy version shows in every audit record</td>
+</tr>
+<tr>
+<td><strong>Approver changes</strong></td>
+<td>Admin UI only, through IAP with your identity; 24-hour activation delay; all approvers notified</td>
+</tr>
+<tr>
+<td><strong>Stuck payments</strong></td>
+<td><code>UNKNOWN</code> older than 15 minutes or any <code>MANUAL_REVIEW</code> pages ops; resolution = check Binance, then confirm in the admin UI or create a new instruction version with fresh approvals</td>
+</tr>
+<tr>
+<td>Scale app tier</td>
+<td>Add <code>app-4</code> at <code>10.10.2.14</code> and the node in <code>apisix.yaml</code> in one CI change</td>
+</tr>
+<tr>
+<td>Rollback</td>
+<td><code>start-update</code> back to the previous template; Cloud Deploy rollback for exec</td>
+</tr>
+<tr>
+<td>Dashboards</td>
+<td>APISIX, app RED metrics, host/Docker, Tempo service graph; <strong>execution: instructions by state, approval latency, rejected approvals, Binance latency and error codes, daily limit usage</strong></td>
+</tr>
+<tr>
+<td>Alerts (Grafana)</td>
+<td>5xx &gt; 1% for 5 min; p95 &gt; 1 s; unhealthy upstream; disk &gt; 80%; no data from a VM for 10 min; <strong>any exec state <code>UNKNOWN</code>/<code>MANUAL_REVIEW</code>; daily limit &gt; 80%</strong></td>
+</tr>
+<tr>
+<td>Alerts (Wazuh)</td>
+<td>Rule level ≥ 10: FIM on config paths, critical CVEs, SCA failures, IAM changes; <strong>Binance secret accessed by anyone but <code>sa-exec</code>; approver or policy change; IAM change in <code>prj-exec</code></strong></td>
+</tr>
+<tr>
+<td>Alerts (Cloud)</td>
+<td>Cloud Armor and Adaptive Protection; <strong>Cloud Monitoring log-based alert on any admin activity in <code>prj-exec</code> or <code>prj-audit</code></strong>, sent to you directly as a backstop</td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>Exec audit bucket is the system of record; monthly check that the hash chain is unbroken; Data Access audit logs on for Secret Manager in both projects</td>
+</tr>
+<tr>
+<td>Key rotation</td>
+<td>Binance key every 90 days and at any staff change; mTLS client certificate for TMS yearly</td>
+</tr>
+<tr>
+<td>Patching</td>
+<td>Golden images monthly or on critical CVEs; exec image rebuilt and redeployed through the approved pipeline</td>
+</tr>
+</tbody>
+</table>
+<h2 id="risks-and-open-decisions">Risks and open decisions</h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Impact</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Compromised approver device or account</td>
+<td>Attacker approves a payment</td>
+<td>Passkey with user verification; destination allowlist and limits in policy; dual approval above threshold; Binance withdrawal whitelist</td>
+</tr>
+<tr>
+<td>Approval screen tampered with</td>
+<td>Ops approve something other than what they see</td>
+<td>Screen served only from <code>prj-exec</code>; data from the service's own stored instruction; HSTS; IAP + Cloud Armor; deploys need your approval</td>
+</tr>
+<tr>
+<td>You are the single owner of exec deploys and policy</td>
+<td>Delays, or a single point of compromise</td>
+<td>Hardware security key on your account; documented break-glass with a second sealed admin; all your actions audited and alerted</td>
+</tr>
+<tr>
+<td>Binance outage or ambiguous response</td>
+<td>Payments stuck in <code>UNKNOWN</code></td>
+<td>Reconciliation worker; <code>MANUAL_REVIEW</code> path; never auto-resend</td>
+</tr>
+<tr>
+<td>Canonicalization bug</td>
+<td>Valid approvals rejected, or two encodings of one instruction</td>
+<td>One canonicalizer library shared by UI and verifier; golden test vectors; amount always a string</td>
+</tr>
+<tr>
+<td>Policy too strict at launch</td>
+<td>Legitimate payments blocked</td>
+<td>Start with real historical payment sizes; policy changes are fast through the pipeline</td>
+</tr>
+<tr>
+<td>WAF false positives on the main API</td>
+<td>Failed API calls</td>
+<td>Preview mode first; per-rule tuning</td>
+</tr>
+<tr>
+<td>App tier cannot autoscale</td>
+<td>Manual scaling</td>
+<td>Size for peak; small CI change to add a VM</td>
+</tr>
+<tr>
+<td>Observability and Wazuh are single VMs</td>
+<td>Monitoring gaps</td>
+<td>Snapshots, GCS-backed storage, Cloud Monitoring backstop alerts; exec audit does not depend on them</td>
+</tr>
+<tr>
+<td>One keyed service account (Wazuh Pub/Sub)</td>
+<td>Key leak exposes the log feed</td>
+<td>Subscriber-only, key in Secret Manager, 90-day rotation</td>
+</tr>
+<tr>
+<td>Single region</td>
+<td>Region outage stops API and payments</td>
+<td>Accept for now; Cloud SQL HA within the region</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Open decisions</strong></p>
+<ul>
+<li><input type="checkbox" disabled> Which Binance operations are allowed: withdrawals only, or also internal / universal transfers</li>
+<li><input type="checkbox" disabled> Per-asset transaction and daily limits, and the dual-approval threshold</li>
+<li><input type="checkbox" disabled> Who the approvers are, and the second sealed break-glass admin</li>
+<li><input type="checkbox" disabled> Approval domain and the ops IP allowlist</li>
+<li><input type="checkbox" disabled> Passkey type: device-bound security keys or synced platform Passkeys</li>
+<li><input type="checkbox" disabled> Audit retention period (bucket lock is irreversible)</li>
+<li><input type="checkbox" disabled> Region: Singapore (<code>asia-southeast1</code>) or Jakarta (<code>asia-southeast2</code>)</li>
+<li><input type="checkbox" disabled> Retention for metrics, logs, traces and Wazuh alerts</li>
+<li><input type="checkbox" disabled> Where Grafana, Wazuh and exec alerts go</li>
+<li><input type="checkbox" disabled> Terraform for both projects before production</li>
+</ul>
+<p><a href="../">All designs</a></p>
+</body></html>
