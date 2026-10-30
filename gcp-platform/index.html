@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow">
+<title>GCP Application Platform Design</title>
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 60rem; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+  a { color: #0b5fff; }
+  h1 { line-height: 1.25; } h2 { margin-top: 2.5rem; border-bottom: 1px solid #e5e5e5; padding-bottom: .3rem; } h3 { margin-top: 1.8rem; }
+  .meta { color: #666; margin-top: -.5rem; }
+  nav { background: #f6f7f9; border: 1px solid #e5e7eb; border-radius: 6px; padding: .8rem 1.2rem; margin: 1.5rem 0; }
+  nav ol { margin: .4rem 0 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #e5e7eb; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #f6f7f9; }
+  code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; padding: .1em .3em; border-radius: 3px; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 6px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; padding: 0; color: inherit; }
+  figure { margin: 1.5rem 0; } figure img { width: 100%; border: 1px solid #e5e7eb; border-radius: 6px; }
+  figcaption { color: #666; font-size: .85rem; }
+  li input[type=checkbox] { margin-right: .4rem; }
+</style></head>
+<body>
+<h1 id="gcp-application-platform-design-lb-cloud-armor-apisix-vmdocker-secret-manager">GCP Application Platform Design — LB, Cloud Armor, APISIX, VM/Docker, Secret Manager</h1>
+<p class="meta">Updated 30 Oct 2026 · Design document</p>
+<nav><strong>Contents</strong><ol><li><a href="#overview">Overview</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#components">Components</a></li><li><a href="#observability-and-security-monitoring">Observability and security monitoring</a></li><li><a href="#network-design">Network design</a></li><li><a href="#security-design">Security design</a></li><li><a href="#implementation-steps">Implementation steps</a></li><li><a href="#operations">Operations</a></li><li><a href="#risks-and-open-decisions">Risks and open decisions</a></li></ol></nav>
+<h2 id="overview">Overview</h2>
+<p>Internet traffic enters through one global external Application Load Balancer with Cloud Armor, reaches Apache APISIX on a private VM group, and APISIX proxies directly to the application containers on a second private VM group. No VM has a public IP. Every VM ships traces, metrics and logs through OpenTelemetry to a self-hosted Grafana stack (Prometheus, Loki, Tempo), and runs a Wazuh agent that reports to a Wazuh SIEM. Secrets live only in Secret Manager and are read with each VM's own service account.</p>
+<p><strong>Scope:</strong> one GCP project, one region, HTTPS APIs served from Docker containers on Compute Engine VMs.</p>
+<p><strong>Assumptions</strong> (change these if they don't hold):</p>
+<ul>
+<li>Region <code>asia-southeast2</code> (Jakarta) or <code>asia-southeast1</code> (Singapore), chosen for data residency.</li>
+<li>Container images are built by CI and pushed to Artifact Registry.</li>
+<li>A public DNS name you control, for example <code>api.example.com</code>.</li>
+</ul>
+<p><strong>Key design decisions</strong></p>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Choice</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge load balancer</td>
+<td>Global external Application LB (<code>EXTERNAL_MANAGED</code>)</td>
+<td>Filters at Google's global edge with Cloud Armor, Adaptive Protection and Google-managed certificates</td>
+</tr>
+<tr>
+<td>WAF</td>
+<td>Cloud Armor backend security policy</td>
+<td>OWASP preconfigured rules, rate limiting, geo and IP rules, Adaptive Protection</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Apache APISIX in Docker on VMs</td>
+<td>Runs inside the VPC, so it reaches private backends; Google API Gateway only calls public backends</td>
+</tr>
+<tr>
+<td>APISIX config mode</td>
+<td>Standalone (<code>config_provider: yaml</code>), no etcd</td>
+<td>Gateway VMs stay stateless and replaceable; config is versioned in Git and shipped by CI</td>
+</tr>
+<tr>
+<td>Gateway to app</td>
+<td>APISIX upstream lists the app VMs' fixed internal IPs, with active health checks</td>
+<td>No internal LB to pay for or operate; APISIX does the load balancing and ejects unhealthy nodes</td>
+</tr>
+<tr>
+<td>App VM IPs</td>
+<td>Stateful regional MIG with preserved internal IPs (<code>10.10.2.11</code>–<code>.13</code>)</td>
+<td>IPs survive autohealing and recreation, so <code>apisix.yaml</code> stays valid</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>OpenTelemetry Collector on every VM → gateway collector → Prometheus, Loki, Tempo, viewed in Grafana</td>
+<td>One vendor-neutral pipeline for metrics, logs and traces; traces link to logs by trace ID</td>
+</tr>
+<tr>
+<td>Security monitoring</td>
+<td>Wazuh (manager, indexer, dashboard) with an agent on every VM</td>
+<td>Host intrusion detection, file integrity, CIS checks, vulnerability detection and a SIEM for audit evidence</td>
+</tr>
+<tr>
+<td>Secrets</td>
+<td>Secret Manager, fetched at boot by the VM service account</td>
+<td>No service-account key files on disk</td>
+</tr>
+<tr>
+<td>Admin access</td>
+<td>IAP TCP forwarding for SSH, Grafana and the Wazuh dashboard; OS Login</td>
+<td>No bastion host and no admin UI exposed to the internet</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<figure><a href="diagram.html"><img src="architecture.png" alt="GCP architecture: Cloud Armor and global LB at the edge; APISIX, app, observability and Wazuh VMs in a private VPC; Secret Manager and Artifact Registry as managed services"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
+<p><strong>Request path.</strong> Client → HTTPS 443 on the global LB → Cloud Armor evaluates the request at Google's edge → LB forwards to an APISIX VM on port 9080 → APISIX checks auth and rate limits, then load-balances across the app VMs on <code>10.10.2.11</code>–<code>.13:8080</code>.</p>
+<p><strong>Telemetry path.</strong> APISIX and the app send traces over OTLP to the OpenTelemetry Collector on their own VM, which also scrapes Prometheus metrics and tails Docker logs. It forwards everything to the gateway collector on the observability VM, which writes metrics to Prometheus, logs to Loki and traces to Tempo. Grafana reads all three.</p>
+<p><strong>Security path.</strong> The Wazuh agent on every VM sends events to the Wazuh manager on 1514/tcp. Cloud Logging (audit, LB and Cloud Armor logs) reaches Wazuh through a log sink and Pub/Sub.</p>
+<p><strong>Boot.</strong> Each VM reads its secrets from Secret Manager and pulls its image from Artifact Registry over Private Google Access. Cloud NAT and IAP are not drawn.</p>
+<h2 id="components">Components</h2>
+<p>The first five rows carry the request path; the rest observe, protect and support it.</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>GCP resource</th>
+<th>Configuration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public IP + TLS</td>
+<td>Global static IP, Google-managed certificate (or Certificate Manager)</td>
+<td>HTTPS 443 only; a second forwarding rule on 80 redirects to HTTPS; SSL policy <code>MODERN</code>, min TLS 1.2</td>
+</tr>
+<tr>
+<td>Edge LB</td>
+<td>Global external Application LB: URL map, target HTTPS proxy, backend service</td>
+<td>Backend service <code>be-apisix</code> points at the gateway MIG on named port <code>http:9080</code>; health check <code>GET /healthz</code> on 9080; logging on, sample rate 1.0</td>
+</tr>
+<tr>
+<td>WAF</td>
+<td>Cloud Armor backend security policy <code>waf-edge</code></td>
+<td>Attached to <code>be-apisix</code>; rules in the Security section</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Regional MIG <code>mig-apisix</code>, 2+ VMs across zones</td>
+<td><code>apache/apisix</code> image in Docker, standalone mode, <code>apisix.yaml</code> from CI; plugins: <code>jwt-auth</code> or <code>openid-connect</code>, <code>limit-count</code>, <code>cors</code>, <code>request-id</code>, <code>prometheus</code>, <code>opentelemetry</code></td>
+</tr>
+<tr>
+<td>Application</td>
+<td>Stateful regional MIG <code>mig-app</code>, 3 VMs at fixed IPs <code>10.10.2.11</code>–<code>.13</code></td>
+<td>App containers in Docker; image from Artifact Registry by digest; APISIX upstream with active health checks on <code>/healthz</code></td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>VM <code>vm-obs</code> (<code>10.10.3.10</code>) in <code>snet-ops</code>, Docker Compose</td>
+<td>OTel Collector (gateway), Prometheus, Loki, Tempo, Grafana; Loki and Tempo store data in GCS buckets, Prometheus on a 200 GB SSD persistent disk</td>
+</tr>
+<tr>
+<td>Telemetry agent</td>
+<td>OTel Collector (contrib) on every VM</td>
+<td>Receives OTLP on <code>127.0.0.1:4317/4318</code>, scrapes <code>/metrics</code>, tails Docker logs, collects host metrics; exports to <code>vm-obs</code></td>
+</tr>
+<tr>
+<td>SIEM / HIDS</td>
+<td>VM <code>vm-wazuh</code> (<code>10.10.3.20</code>) in <code>snet-ops</code>, Wazuh single-node Docker deployment</td>
+<td>Manager, indexer, dashboard; agents on every VM; Pub/Sub feed of Cloud Logging</td>
+</tr>
+<tr>
+<td>Secrets</td>
+<td>Secret Manager</td>
+<td>One secret per credential, regional replication, accessor IAM per secret</td>
+</tr>
+<tr>
+<td>Images</td>
+<td>Artifact Registry (Docker repo)</td>
+<td>VM service accounts get <code>roles/artifactregistry.reader</code> on that repo only</td>
+</tr>
+<tr>
+<td>Egress</td>
+<td>Cloud Router + Cloud NAT</td>
+<td>Outbound internet for VMs without public IPs (OS updates, Wazuh vulnerability feeds, third-party APIs)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>VM image.</strong> Use one Ubuntu LTS golden image for every VM, with Docker Engine, the OTel Collector and the Wazuh agent preinstalled. Container-Optimized OS is smaller and read-only, but it cannot install host packages, so it would need the collector and Wazuh agent as containers, which weakens host-level monitoring. Build an instance template per release and roll it out through the MIG.</p>
+<p><strong>Why APISIX standalone.</strong> In standalone mode APISIX reads routes, upstreams and consumers from <code>conf/apisix.yaml</code> and has no Admin API, so there is no etcd cluster to run and no admin port to protect. A config change is a new file shipped by CI followed by a MIG rolling restart (or a file reload, which APISIX picks up automatically).</p>
+<p><strong>Scaling the app tier.</strong> A stateful MIG cannot autoscale, so adding capacity means adding a VM with the next fixed IP and adding that IP to <code>apisix.yaml</code> in the same CI change. If you need autoscaling later, either run the app containers on the APISIX VMs (upstream <code>127.0.0.1:8080</code>, both tiers scale together) or bring back an internal LB.</p>
+<h2 id="observability-and-security-monitoring">Observability and security monitoring</h2>
+<p>One OpenTelemetry pipeline carries all three signals to self-hosted backends, and Wazuh watches every host; both stacks live in a separate <code>snet-ops</code> subnet that the workload VMs can only push to.</p>
+<h3 id="signal-flow">Signal flow</h3>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Source</th>
+<th>Collected by</th>
+<th>Stored in</th>
+<th>Retention (starting point)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Traces</td>
+<td>APISIX <code>opentelemetry</code> plugin, app OTel SDK</td>
+<td>OTLP → local collector → gateway collector (tail sampling: keep errors + slow, 10% of the rest)</td>
+<td>Tempo, GCS bucket <code>PROJECT-tempo</code></td>
+<td>14 days</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>APISIX <code>prometheus</code> plugin (<code>:9091</code>), app <code>/metrics</code>, <code>hostmetrics</code>, <code>docker_stats</code></td>
+<td>Local collector scrapes → gateway collector → Prometheus remote write</td>
+<td>Prometheus, SSD persistent disk</td>
+<td>30 days</td>
+</tr>
+<tr>
+<td>Logs</td>
+<td>Docker JSON logs (APISIX access log, app logs), syslog</td>
+<td>Local collector <code>filelog</code> receiver → gateway collector → Loki OTLP endpoint</td>
+<td>Loki, GCS bucket <code>PROJECT-loki</code></td>
+<td>30 days</td>
+</tr>
+<tr>
+<td>Cloud logs</td>
+<td>LB, Cloud Armor, audit logs</td>
+<td>Stay in Cloud Logging; Grafana's Google Cloud Logging data source for ad-hoc views</td>
+<td>Cloud Logging</td>
+<td>per log bucket</td>
+</tr>
+<tr>
+<td>Security events</td>
+<td>Wazuh agents (FIM, SCA, rootcheck, log analysis, vulnerability detection); Cloud Logging via Pub/Sub</td>
+<td>Wazuh manager</td>
+<td>Wazuh indexer</td>
+<td>90 days hot, then snapshot to GCS</td>
+</tr>
+</tbody>
+</table>
+<p>APISIX writes the trace ID into its access log (<code>opentelemetry</code> plugin with <code>set_ngx_var: true</code>, <code>$opentelemetry_trace_id</code> in the log format), so Grafana jumps from a Tempo trace to its Loki log lines and back.</p>
+<h3 id="observability-vm-vm-obs">Observability VM (<code>vm-obs</code>)</h3>
+<ul>
+<li>e2-standard-4 to start; Docker Compose runs <code>otel-collector-contrib</code>, <code>prometheus</code> (with <code>--web.enable-remote-write-receiver</code>), <code>loki</code> (GCS backend), <code>tempo</code> (GCS backend, metrics-generator writing service-graph metrics to Prometheus) and <code>grafana</code>.</li>
+<li>Grafana data sources: Prometheus, Loki, Tempo (trace-to-logs and trace-to-metrics links on), Google Cloud Monitoring and Logging through the VM's service account.</li>
+<li>Grafana admin password and OIDC client secret come from Secret Manager at boot.</li>
+<li>Reached only through IAP: <code>gcloud compute start-iap-tunnel vm-obs 3000 --local-host-port=localhost:3000</code>.</li>
+<li>Alerting from Grafana to your chat or on-call tool; the alert rules are listed under Operations.</li>
+</ul>
+<h3 id="wazuh-vm-vm-wazuh">Wazuh VM (<code>vm-wazuh</code>)</h3>
+<ul>
+<li>Official <code>wazuh-docker</code> single-node deployment (manager, indexer, dashboard). Start at 4 vCPU / 16 GB RAM and a 200 GB SSD disk, then size by agent count and retention. Set <code>vm.max_map_count=262144</code> on the host for the indexer.</li>
+<li>Agents are baked into the golden image and enrol on first boot with an enrolment password from Secret Manager (<code>wazuh-enrollment-password</code>), manager address <code>10.10.3.20</code>, ports 1515 (enrol) and 1514 (events).</li>
+<li>Turn on: file integrity monitoring for <code>/etc</code>, <code>/opt/apisix</code>, Docker configs; SCA with the CIS Ubuntu benchmark; vulnerability detection; Docker listener module; log analysis of <code>auth.log</code> and APISIX access logs.</li>
+<li>GCP feed: a Cloud Logging sink (admin activity + data access audit logs, LB and Cloud Armor logs) to a Pub/Sub topic; the Wazuh <code>gcp-pubsub</code> module pulls from the subscription. That module authenticates with a service-account key file, so it is the one keyed account in the design: give it only <code>roles/pubsub.subscriber</code> on that subscription, keep the key in Secret Manager, write it to tmpfs at boot, rotate every 90 days.</li>
+<li>Leave active response (automatic IP blocking) off until rules are tuned; block at Cloud Armor instead.</li>
+<li>Dashboard reached only through IAP on port 443; admin and API credentials in Secret Manager.</li>
+</ul>
+<h2 id="network-design">Network design</h2>
+<p>One custom-mode VPC with three subnets; only Google's load balancer ranges reach the gateway, only APISIX reaches the app, and workload VMs can only push telemetry and security events to the ops subnet.</p>
+<table>
+<thead>
+<tr>
+<th>Subnet</th>
+<th>Example CIDR</th>
+<th>Purpose</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>snet-gateway</code></td>
+<td>10.10.1.0/24</td>
+<td>APISIX VMs</td>
+<td>Private Google Access on</td>
+</tr>
+<tr>
+<td><code>snet-app</code></td>
+<td>10.10.2.0/24</td>
+<td>App VMs at fixed IPs <code>.11</code>–<code>.13</code></td>
+<td>Private Google Access on</td>
+</tr>
+<tr>
+<td><code>snet-ops</code></td>
+<td>10.10.3.0/24</td>
+<td><code>vm-obs</code> (<code>.10</code>), <code>vm-wazuh</code> (<code>.20</code>)</td>
+<td>Private Google Access on; static internal IPs</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Firewall rules</strong> (VPC firewall policy or VPC rules; deny everything else by default):</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Direction</th>
+<th>Source</th>
+<th>Target (service account)</th>
+<th>Port</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow-glb-to-apisix</code></td>
+<td>Ingress</td>
+<td>35.191.0.0/16, 130.211.0.0/22 (Google Front End + health checks)</td>
+<td><code>sa-apisix</code></td>
+<td>tcp:9080</td>
+</tr>
+<tr>
+<td><code>allow-apisix-to-app</code></td>
+<td>Ingress</td>
+<td><code>sa-apisix</code></td>
+<td><code>sa-app</code></td>
+<td>tcp:8080</td>
+</tr>
+<tr>
+<td><code>allow-hc-to-app</code></td>
+<td>Ingress</td>
+<td>35.191.0.0/16, 130.211.0.0/22 (MIG autohealing checks)</td>
+<td><code>sa-app</code></td>
+<td>tcp:8080</td>
+</tr>
+<tr>
+<td><code>allow-otlp-to-obs</code></td>
+<td>Ingress</td>
+<td><code>sa-apisix</code>, <code>sa-app</code>, <code>sa-wazuh</code></td>
+<td><code>sa-obs</code></td>
+<td>tcp:4317, tcp:4318</td>
+</tr>
+<tr>
+<td><code>allow-agents-to-wazuh</code></td>
+<td>Ingress</td>
+<td><code>sa-apisix</code>, <code>sa-app</code>, <code>sa-obs</code></td>
+<td><code>sa-wazuh</code></td>
+<td>tcp:1514, tcp:1515</td>
+</tr>
+<tr>
+<td><code>allow-iap-admin</code></td>
+<td>Ingress</td>
+<td>35.235.240.0/20 (IAP)</td>
+<td>all VMs</td>
+<td>tcp:22; plus tcp:3000 on <code>sa-obs</code>, tcp:443 on <code>sa-wazuh</code></td>
+</tr>
+<tr>
+<td><code>deny-all-ingress</code></td>
+<td>Ingress</td>
+<td>0.0.0.0/0</td>
+<td>all</td>
+<td>all, lowest priority</td>
+</tr>
+</tbody>
+</table>
+<p>Target firewall rules by <strong>service account</strong>, not network tag: only users with <code>iam.serviceAccountUser</code> can attach a service account, while anyone who can edit a VM can change its tags.</p>
+<p><strong>Egress.</strong> VMs have no external IP. Cloud NAT on a Cloud Router gives them outbound internet; Private Google Access sends Secret Manager, Artifact Registry and Logging calls over Google's network. If you need to stop data exfiltration to arbitrary hosts, add egress firewall rules or a Secure Web Proxy allowlist.</p>
+<h2 id="security-design">Security design</h2>
+<p>Security is layered: Cloud Armor filters at Google's edge, APISIX authenticates and throttles per consumer, and IAM limits each VM to the secrets and images it needs.</p>
+<h3 id="cloud-armor-policy-waf-edge">Cloud Armor policy <code>waf-edge</code></h3>
+<p>Start every WAF rule in <strong>preview mode</strong> for about a week, review the logs for false positives, then switch to enforce.</p>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Rule</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100</td>
+<td>Allowlist: office / partner CIDRs (optional)</td>
+<td>allow</td>
+</tr>
+<tr>
+<td>200</td>
+<td>Denylist: known bad IPs, or geo block with <code>origin.region_code</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1000</td>
+<td><code>evaluatePreconfiguredWaf('sqli-v33-stable', {'sensitivity': 1})</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1010</td>
+<td><code>xss-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1020</td>
+<td><code>lfi-v33-stable</code>, <code>rfi-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1030</td>
+<td><code>rce-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1040</td>
+<td><code>methodenforcement-v33-stable</code>, <code>protocolattack-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>1050</td>
+<td><code>scannerdetection-v33-stable</code>, <code>sessionfixation-v33-stable</code></td>
+<td>deny(403)</td>
+</tr>
+<tr>
+<td>2000</td>
+<td>Rate-based ban per client IP (for example 600 requests / 60 s, ban 300 s)</td>
+<td>rate_based_ban, 429</td>
+</tr>
+<tr>
+<td>2147483647</td>
+<td>Default</td>
+<td>allow</td>
+</tr>
+</tbody>
+</table>
+<p>Also turn on <strong>Adaptive Protection</strong> (layer-7 DDoS anomaly detection) and set <code>--json-parsing=STANDARD</code> so WAF rules inspect JSON bodies field by field. Begin at sensitivity 1 and raise it only after tuning.</p>
+<h3 id="tls">TLS</h3>
+<ul>
+<li>Client to LB: Google-managed certificate, SSL policy <code>MODERN</code>, minimum TLS 1.2, HTTP redirects to HTTPS.</li>
+<li>LB to APISIX and APISIX to app: HTTP inside the VPC is acceptable for many workloads. If your regulator requires encryption in transit inside the VPC, set the backend service protocol to HTTPS with a private-CA certificate on APISIX, and use an APISIX upstream with <code>scheme: https</code> (or mTLS) to the app.</li>
+<li>Telemetry and Wazuh: enable TLS on the gateway collector's OTLP receiver; Wazuh agent traffic is encrypted by default.</li>
+</ul>
+<h3 id="identity-and-iam">Identity and IAM</h3>
+<table>
+<thead>
+<tr>
+<th>Service account</th>
+<th>Roles (granted on the narrowest resource)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sa-apisix</code></td>
+<td><code>secretmanager.secretAccessor</code> on gateway secrets + <code>wazuh-enrollment-password</code>; <code>artifactregistry.reader</code> on the repo; <code>storage.objectViewer</code> on the config bucket</td>
+</tr>
+<tr>
+<td><code>sa-app</code></td>
+<td><code>secretmanager.secretAccessor</code> on app secrets + <code>wazuh-enrollment-password</code>; <code>artifactregistry.reader</code></td>
+</tr>
+<tr>
+<td><code>sa-obs</code></td>
+<td><code>storage.objectAdmin</code> on the Loki and Tempo buckets; <code>secretmanager.secretAccessor</code> on Grafana secrets; <code>monitoring.viewer</code> and <code>logging.viewer</code> for Grafana's Google Cloud data sources</td>
+</tr>
+<tr>
+<td><code>sa-wazuh</code></td>
+<td><code>secretmanager.secretAccessor</code> on Wazuh secrets; <code>storage.objectAdmin</code> on the Wazuh snapshot bucket</td>
+</tr>
+<tr>
+<td><code>sa-wazuh-pubsub</code> (keyed, see Wazuh)</td>
+<td><code>pubsub.subscriber</code> on the Wazuh subscription only</td>
+</tr>
+<tr>
+<td><code>sa-deployer</code> (CI, through Workload Identity Federation)</td>
+<td><code>compute.instanceAdmin.v1</code>, <code>iam.serviceAccountUser</code> on the VM accounts, <code>artifactregistry.writer</code>, <code>storage.objectAdmin</code> on the config bucket</td>
+</tr>
+</tbody>
+</table>
+<p>No service-account key files except the one Wazuh Pub/Sub reader. Humans reach VMs through IAP + OS Login (<code>roles/iap.tunnelResourceAccessor</code>, <code>roles/compute.osLogin</code>).</p>
+<h3 id="secret-handling">Secret handling</h3>
+<ol>
+<li>Store each credential as its own secret (<code>db-password</code>, <code>jwt-signing-key</code>, <code>apisix-consumer-partner-a</code>), regional replication in the deployment region.</li>
+<li>At boot, a startup script reads the secrets with the VM's metadata-server identity (<code>gcloud secrets versions access latest --secret=…</code>) and writes them to a <code>tmpfs</code> file readable only by the container user.</li>
+<li>Docker gets them as an env file or a mounted file; APISIX references them as <code>$ENV://NAME</code> in <code>apisix.yaml</code>, so no secret value is stored in Git.</li>
+<li>Rotation = add a new secret version, then roll the MIG. Pin versions (<code>versions/7</code>) instead of <code>latest</code> if you need controlled rollouts.</li>
+</ol>
+<p>APISIX also has a native GCP Secret Manager provider (<code>$secret://gcp/…</code>), but it authenticates with a service-account key JSON. Avoid it here; the boot-time fetch keeps you keyless.</p>
+<h3 id="vm-hardening">VM hardening</h3>
+<ul>
+<li>Shielded VM (Secure Boot, vTPM, integrity monitoring); OS Login on; serial port off; project-wide SSH keys blocked.</li>
+<li>Containers run as a non-root user, read-only root filesystem, <code>no-new-privileges</code>, only the needed ports published.</li>
+<li>Images pinned by digest; Artifact Registry vulnerability scanning on; optionally Binary Authorization-style signing in CI.</li>
+</ul>
+<h2 id="implementation-steps">Implementation steps</h2>
+<p>Build bottom-up: network and identity first, then secrets, then VMs, and the public LB with Cloud Armor last, so nothing is exposed before it is protected. Run steps 9 and 10 (observability and Wazuh VMs) before you start the gateway and app groups in steps 7 and 8, so every workload VM is watched from first boot. Commands use these variables:</p>
+<pre><code class="language-bash">export PROJECT_ID=my-project REGION=asia-southeast2 ZONE=asia-southeast2-a DOMAIN=api.example.com
+for N in apisix app obs wazuh; do
+  export SA_${N^^}=sa-${N}@${PROJECT_ID}.iam.gserviceaccount.com
+done
+gcloud config set project $PROJECT_ID
+</code></pre>
+<h3 id="1-enable-apis">1. Enable APIs</h3>
+<pre><code class="language-bash">gcloud services enable compute.googleapis.com secretmanager.googleapis.com \
+  artifactregistry.googleapis.com iap.googleapis.com logging.googleapis.com \
+  monitoring.googleapis.com pubsub.googleapis.com storage.googleapis.com
+</code></pre>
+<h3 id="2-vpc-subnets-nat">2. VPC, subnets, NAT</h3>
+<pre><code class="language-bash">gcloud compute networks create vpc-app --subnet-mode=custom
+for S in &quot;snet-gateway 10.10.1.0/24&quot; &quot;snet-app 10.10.2.0/24&quot; &quot;snet-ops 10.10.3.0/24&quot;; do
+  set -- $S
+  gcloud compute networks subnets create $1 --network=vpc-app --region=$REGION \
+    --range=$2 --enable-private-ip-google-access
+done
+gcloud compute routers create rtr-app --network=vpc-app --region=$REGION
+gcloud compute routers nats create nat-app --router=rtr-app --region=$REGION \
+  --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges
+</code></pre>
+<h3 id="3-service-accounts-and-firewall">3. Service accounts and firewall</h3>
+<pre><code class="language-bash">for N in apisix app obs wazuh; do gcloud iam service-accounts create sa-$N; done
+for SA in $SA_APISIX $SA_APP $SA_OBS $SA_WAZUH; do
+  gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$SA --role=roles/logging.logWriter
+done
+for ROLE in roles/monitoring.viewer roles/logging.viewer; do
+  gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$SA_OBS --role=$ROLE
+done
+
+FW=&quot;gcloud compute firewall-rules create --network=vpc-app --direction=INGRESS&quot;
+$FW allow-glb-to-apisix --source-ranges=35.191.0.0/16,130.211.0.0/22 \
+  --target-service-accounts=$SA_APISIX --allow=tcp:9080
+$FW allow-apisix-to-app --source-service-accounts=$SA_APISIX \
+  --target-service-accounts=$SA_APP --allow=tcp:8080
+$FW allow-hc-to-app --source-ranges=35.191.0.0/16,130.211.0.0/22 \
+  --target-service-accounts=$SA_APP --allow=tcp:8080
+$FW allow-otlp-to-obs --source-service-accounts=$SA_APISIX,$SA_APP,$SA_WAZUH \
+  --target-service-accounts=$SA_OBS --allow=tcp:4317,tcp:4318
+$FW allow-agents-to-wazuh --source-service-accounts=$SA_APISIX,$SA_APP,$SA_OBS \
+  --target-service-accounts=$SA_WAZUH --allow=tcp:1514,tcp:1515
+$FW allow-iap-ssh --source-ranges=35.235.240.0/20 --allow=tcp:22
+$FW allow-iap-grafana --source-ranges=35.235.240.0/20 --target-service-accounts=$SA_OBS --allow=tcp:3000
+$FW allow-iap-wazuh-ui --source-ranges=35.235.240.0/20 --target-service-accounts=$SA_WAZUH --allow=tcp:443
+</code></pre>
+<h3 id="4-artifact-registry-and-config-bucket">4. Artifact Registry and config bucket</h3>
+<pre><code class="language-bash">gcloud artifacts repositories create apps --repository-format=docker --location=$REGION
+for SA in $SA_APISIX $SA_APP; do
+  gcloud artifacts repositories add-iam-policy-binding apps --location=$REGION \
+    --member=serviceAccount:$SA --role=roles/artifactregistry.reader
+done
+gcloud storage buckets create gs://${PROJECT_ID}-apisix-config --location=$REGION --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://${PROJECT_ID}-apisix-config \
+  --member=serviceAccount:$SA_APISIX --role=roles/storage.objectViewer
+</code></pre>
+<p>CI uploads <code>config.yaml</code> and <code>apisix.yaml</code> to the bucket; the gateway VMs read them at boot.</p>
+<h3 id="5-secrets">5. Secrets</h3>
+<pre><code class="language-bash">printf '%s' &quot;$DB_PASSWORD&quot; | gcloud secrets create db-password \
+  --replication-policy=user-managed --locations=$REGION --data-file=-
+gcloud secrets add-iam-policy-binding db-password \
+  --member=serviceAccount:$SA_APP --role=roles/secretmanager.secretAccessor
+
+printf '%s' &quot;$PARTNER_A_JWT_SECRET&quot; | gcloud secrets create apisix-partner-a-jwt \
+  --replication-policy=user-managed --locations=$REGION --data-file=-
+gcloud secrets add-iam-policy-binding apisix-partner-a-jwt \
+  --member=serviceAccount:$SA_APISIX --role=roles/secretmanager.secretAccessor
+</code></pre>
+<h3 id="6-apisix-configuration-standalone">6. APISIX configuration (standalone)</h3>
+<p><code>config.yaml</code>:</p>
+<pre><code class="language-yaml">deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+apisix:
+  node_listen: 9080
+nginx_config:
+  envs:
+    - PARTNER_A_JWT_SECRET
+  error_log: /dev/stderr
+  http:
+    access_log: /dev/stdout
+    access_log_format: '$remote_addr [$time_local] &quot;$request&quot; $status $body_bytes_sent $request_time &quot;$upstream_addr&quot; trace_id=$opentelemetry_trace_id'
+plugin_attr:
+  prometheus:
+    export_addr:
+      ip: 0.0.0.0
+      port: 9091
+  opentelemetry:
+    resource:
+      service.name: apisix
+    collector:
+      address: 127.0.0.1:4318   # local OTel Collector, OTLP/HTTP
+    set_ngx_var: true           # exposes $opentelemetry_trace_id to the access log
+</code></pre>
+<p>Check that <code>prometheus</code> and <code>opentelemetry</code> are in the enabled <code>plugins</code> list of your APISIX version; if you override <code>plugins</code>, the default list is replaced, not extended.</p>
+<p><code>apisix.yaml</code> (the file must end with <code>#END</code>):</p>
+<pre><code class="language-yaml">global_rules:
+  - id: tracing
+    plugins:
+      opentelemetry:
+        sampler:
+          name: always_on      # the gateway collector does tail sampling
+routes:
+  - id: healthz
+    uri: /healthz
+    plugins:
+      mocking:
+        response_status: 200
+        response_example: &quot;ok&quot;
+  - id: orders-api
+    uri: /api/orders/*
+    upstream_id: app
+    plugins:
+      jwt-auth: {}
+      limit-count:
+        count: 100
+        time_window: 60
+        key_type: var
+        key: consumer_name
+        rejected_code: 429
+      request-id: {}
+upstreams:
+  - id: app
+    type: roundrobin
+    nodes:
+      &quot;10.10.2.11:8080&quot;: 1
+      &quot;10.10.2.12:8080&quot;: 1
+      &quot;10.10.2.13:8080&quot;: 1
+    checks:
+      active:
+        type: http
+        http_path: /healthz
+        healthy:   { interval: 5, successes: 2 }
+        unhealthy: { interval: 5, http_failures: 3, tcp_failures: 3, timeouts: 3 }
+      passive:
+        healthy:   { http_statuses: [200, 201, 204], successes: 3 }
+        unhealthy: { http_statuses: [500, 502, 503, 504], http_failures: 3, tcp_failures: 3 }
+consumers:
+  - username: partner_a
+    plugins:
+      jwt-auth:
+        key: partner-a
+        secret: $ENV://PARTNER_A_JWT_SECRET
+#END
+</code></pre>
+<h3 id="7-gateway-vm-startup-script-and-mig">7. Gateway VM startup script and MIG</h3>
+<p><code>startup-apisix.sh</code> (Ubuntu LTS image with Docker Engine; on Container-Optimized OS use the Secret Manager REST API with a metadata-server token instead of <code>gcloud</code>):</p>
+<pre><code class="language-bash">#!/bin/bash
+set -euo pipefail
+mkdir -p /opt/apisix /run/secrets &amp;&amp; mount -t tmpfs -o size=1m,mode=0700 tmpfs /run/secrets
+
+# Wazuh agent (installed in the golden image, not yet started)
+gcloud secrets versions access latest --secret=wazuh-enrollment-password &gt; /var/ossec/etc/authd.pass
+chown root:wazuh /var/ossec/etc/authd.pass &amp;&amp; chmod 640 /var/ossec/etc/authd.pass
+sed -i 's|&lt;address&gt;.*&lt;/address&gt;|&lt;address&gt;10.10.3.20&lt;/address&gt;|' /var/ossec/etc/ossec.conf
+systemctl enable --now wazuh-agent
+
+# OTel Collector agent (config baked into /etc/otelcol-contrib/config.yaml)
+systemctl enable --now otelcol-contrib
+
+# APISIX
+gcloud storage cp gs://PROJECT_ID-apisix-config/{config.yaml,apisix.yaml} /opt/apisix/
+echo &quot;PARTNER_A_JWT_SECRET=$(gcloud secrets versions access latest --secret=apisix-partner-a-jwt)&quot; &gt; /run/secrets/apisix.env
+chmod 600 /run/secrets/apisix.env
+docker rm -f apisix 2&gt;/dev/null || true
+docker run -d --name apisix --restart=always --network=host \
+  --env-file /run/secrets/apisix.env --read-only --tmpfs /usr/local/apisix/logs --tmpfs /tmp \
+  --security-opt no-new-privileges \
+  -v /opt/apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro \
+  -v /opt/apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro \
+  apache/apisix:&lt;pinned-version&gt;
+</code></pre>
+<p>APISIX runs with <code>--network=host</code> so it reaches the collector on <code>127.0.0.1:4318</code>, and the collector scrapes APISIX metrics on <code>127.0.0.1:9091</code>. Firewall rules still allow only port 9080 in from outside.</p>
+<pre><code class="language-bash">gcloud compute instance-templates create tpl-apisix-v1 --machine-type=e2-standard-2 \
+  --region=$REGION --subnet=snet-gateway --no-address \
+  --service-account=$SA_APISIX --scopes=cloud-platform \
+  --image-family=&lt;ubuntu-lts-family-with-docker-or-your-golden-image&gt; --image-project=&lt;project&gt; \
+  --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+  --metadata=enable-oslogin=TRUE,block-project-ssh-keys=TRUE \
+  --metadata-from-file=startup-script=startup-apisix.sh
+
+gcloud compute health-checks create http hc-apisix --port=9080 --request-path=/healthz
+gcloud compute instance-groups managed create mig-apisix --region=$REGION \
+  --template=tpl-apisix-v1 --size=2 --health-check=hc-apisix --initial-delay=120
+gcloud compute instance-groups managed set-named-ports mig-apisix --region=$REGION --named-ports=http:9080
+gcloud compute instance-groups managed set-autoscaling mig-apisix --region=$REGION \
+  --min-num-replicas=2 --max-num-replicas=6 --target-cpu-utilization=0.6
+</code></pre>
+<p>Build one golden image (Packer) for every VM: Ubuntu LTS, Docker Engine, <code>otelcol-contrib</code> with the agent config from step 9, and the Wazuh agent pinned to the manager's version (installed, not started). Faster scale-out, no dependency on package mirrors at boot, and every VM is watched from its first minute.</p>
+<h3 id="8-app-tier-stateful-mig-with-fixed-ips">8. App tier: stateful MIG with fixed IPs</h3>
+<p>The app VMs use the same golden image; <code>startup-app.sh</code> starts the Wazuh agent and collector exactly as in step 7, fetches <code>db-password</code>, and runs the app image from Artifact Registry by digest, publishing port 8080 and pointing its OTel SDK at <code>http://127.0.0.1:4318</code>.</p>
+<pre><code class="language-bash">gcloud compute instance-templates create tpl-app-v1 --machine-type=e2-standard-2 \
+  --region=$REGION --subnet=snet-app --no-address \
+  --service-account=$SA_APP --scopes=cloud-platform \
+  --image=&lt;golden-image&gt; --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+  --metadata=enable-oslogin=TRUE,block-project-ssh-keys=TRUE \
+  --metadata-from-file=startup-script=startup-app.sh
+
+gcloud compute health-checks create http hc-app --port=8080 --request-path=/healthz
+gcloud compute instance-groups managed create mig-app --region=$REGION \
+  --template=tpl-app-v1 --size=0 --health-check=hc-app --initial-delay=120 \
+  --instance-redistribution-type=NONE
+
+for i in 1 2 3; do
+  gcloud compute instance-groups managed create-instance mig-app --region=$REGION \
+    --instance=app-$i --stateful-internal-ip=interface-name=nic0,address=10.10.2.1$i,auto-delete=never
+done
+</code></pre>
+<p>Autohealing recreates a failed VM with the same name and IP, so APISIX's upstream list never changes. APISIX's active health checks take a VM out of rotation within about 15 seconds; MIG autohealing replaces it.</p>
+<h3 id="9-observability-vm">9. Observability VM</h3>
+<pre><code class="language-bash">gcloud compute addresses create ip-obs --region=$REGION --subnet=snet-ops --addresses=10.10.3.10
+for B in loki tempo; do
+  gcloud storage buckets create gs://${PROJECT_ID}-$B --location=$REGION --uniform-bucket-level-access
+  gcloud storage buckets add-iam-policy-binding gs://${PROJECT_ID}-$B \
+    --member=serviceAccount:$SA_OBS --role=roles/storage.objectAdmin
+done
+printf '%s' &quot;$GRAFANA_ADMIN_PASSWORD&quot; | gcloud secrets create grafana-admin \
+  --replication-policy=user-managed --locations=$REGION --data-file=-
+gcloud secrets add-iam-policy-binding grafana-admin --member=serviceAccount:$SA_OBS \
+  --role=roles/secretmanager.secretAccessor
+
+gcloud compute disks create disk-prometheus --zone=$ZONE --size=200GB --type=pd-ssd
+gcloud compute instances create vm-obs --zone=$ZONE --machine-type=e2-standard-4 \
+  --subnet=snet-ops --private-network-ip=10.10.3.10 --no-address \
+  --service-account=$SA_OBS --scopes=cloud-platform --image=&lt;golden-image&gt; \
+  --disk=name=disk-prometheus,device-name=prometheus \
+  --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+  --metadata=enable-oslogin=TRUE --metadata-from-file=startup-script=startup-obs.sh
+</code></pre>
+<p><code>startup-obs.sh</code> mounts the Prometheus disk at <code>/mnt/prometheus</code>, writes <code>grafana-admin</code> to <code>/run/secrets</code>, starts the Wazuh agent, then runs <code>docker compose up -d</code> with:</p>
+<pre><code class="language-yaml">services:
+  otel-gateway:
+    image: otel/opentelemetry-collector-contrib:&lt;pinned&gt;
+    volumes: [&quot;./otel-gateway.yaml:/etc/otelcol-contrib/config.yaml:ro&quot;]
+    ports: [&quot;4317:4317&quot;, &quot;4318:4318&quot;]
+  prometheus:
+    image: prom/prometheus:&lt;pinned&gt;
+    command: [&quot;--config.file=/etc/prometheus/prometheus.yml&quot;, &quot;--storage.tsdb.retention.time=30d&quot;,
+              &quot;--web.enable-remote-write-receiver&quot;]
+    volumes: [&quot;./prometheus.yml:/etc/prometheus/prometheus.yml:ro&quot;, &quot;/mnt/prometheus:/prometheus&quot;]
+  loki:
+    image: grafana/loki:&lt;pinned&gt;          # 3.x: OTLP ingest on /otlp, GCS object store
+    command: [&quot;-config.file=/etc/loki/config.yaml&quot;]
+    volumes: [&quot;./loki.yaml:/etc/loki/config.yaml:ro&quot;]
+  tempo:
+    image: grafana/tempo:&lt;pinned&gt;         # GCS backend, metrics-generator -&gt; Prometheus
+    command: [&quot;-config.file=/etc/tempo.yaml&quot;]
+    volumes: [&quot;./tempo.yaml:/etc/tempo.yaml:ro&quot;]
+  grafana:
+    image: grafana/grafana:&lt;pinned&gt;
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin
+    volumes: [&quot;/run/secrets/grafana-admin:/run/secrets/grafana-admin:ro&quot;, &quot;./provisioning:/etc/grafana/provisioning:ro&quot;]
+    ports: [&quot;3000:3000&quot;]                  # reachable only from the IAP range
+</code></pre>
+<p>Gateway collector (<code>otel-gateway.yaml</code>):</p>
+<pre><code class="language-yaml">receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+processors:
+  memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+      - { name: slow,   type: latency,     latency: { threshold_ms: 1000 } }
+      - { name: rest,   type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+  batch: {}
+exporters:
+  otlp/tempo:            { endpoint: tempo:4317, tls: { insecure: true } }
+  prometheusremotewrite: { endpoint: http://prometheus:9090/api/v1/write }
+  otlphttp/loki:         { endpoint: http://loki:3100/otlp }
+service:
+  pipelines:
+    traces:  { receivers: [otlp], processors: [memory_limiter, tail_sampling, batch], exporters: [otlp/tempo] }
+    metrics: { receivers: [otlp], processors: [memory_limiter, batch], exporters: [prometheusremotewrite] }
+    logs:    { receivers: [otlp], processors: [memory_limiter, batch], exporters: [otlphttp/loki] }
+</code></pre>
+<p>Agent collector on every VM (<code>/etc/otelcol-contrib/config.yaml</code>, baked into the golden image; the <code>otelcol-contrib</code> user needs the <code>docker</code> group):</p>
+<pre><code class="language-yaml">receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 127.0.0.1:4317 }
+      http: { endpoint: 127.0.0.1:4318 }
+  hostmetrics:
+    collection_interval: 30s
+    scrapers: { cpu: {}, memory: {}, disk: {}, filesystem: {}, network: {}, load: {} }
+  docker_stats: { endpoint: unix:///var/run/docker.sock }
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: apisix            # remove on app VMs; add the app's /metrics instead
+          scrape_interval: 15s
+          metrics_path: /apisix/prometheus/metrics
+          static_configs: [{ targets: [&quot;127.0.0.1:9091&quot;] }]
+  filelog:
+    include: [/var/lib/docker/containers/*/*-json.log]
+    operators: [{ type: container, format: docker }]
+processors:
+  resourcedetection: { detectors: [gcp, system] }
+  batch: {}
+exporters:
+  otlp: { endpoint: 10.10.3.10:4317, tls: { insecure: true } }   # switch to TLS before production
+service:
+  pipelines:
+    traces:  { receivers: [otlp], processors: [resourcedetection, batch], exporters: [otlp] }
+    metrics: { receivers: [otlp, hostmetrics, docker_stats, prometheus], processors: [resourcedetection, batch], exporters: [otlp] }
+    logs:    { receivers: [otlp, filelog], processors: [resourcedetection, batch], exporters: [otlp] }
+</code></pre>
+<p>Open Grafana with <code>gcloud compute start-iap-tunnel vm-obs 3000 --local-host-port=localhost:3000 --zone=$ZONE</code>, then provision the Prometheus, Loki and Tempo data sources (Tempo with trace-to-logs on Loki).</p>
+<h3 id="10-wazuh-vm-and-gcp-log-feed">10. Wazuh VM and GCP log feed</h3>
+<pre><code class="language-bash">gcloud compute addresses create ip-wazuh --region=$REGION --subnet=snet-ops --addresses=10.10.3.20
+gcloud compute instances create vm-wazuh --zone=$ZONE --machine-type=e2-standard-4 \
+  --subnet=snet-ops --private-network-ip=10.10.3.20 --no-address \
+  --service-account=$SA_WAZUH --scopes=cloud-platform --image=&lt;golden-image&gt; \
+  --boot-disk-size=200GB --boot-disk-type=pd-ssd \
+  --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring --metadata=enable-oslogin=TRUE
+</code></pre>
+<p>On the VM (through IAP SSH):</p>
+<pre><code class="language-bash">echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-wazuh.conf &amp;&amp; sudo sysctl --system
+git clone https://github.com/wazuh/wazuh-docker.git -b v&lt;pinned-version&gt; &amp;&amp; cd wazuh-docker/single-node
+docker compose -f generate-indexer-certs.yml run --rm generator
+docker compose up -d
+</code></pre>
+<p>Then change every default password (indexer admin, API user, dashboard) and store them in Secret Manager. Create the agent enrolment secret:</p>
+<pre><code class="language-bash">printf '%s' &quot;$WAZUH_ENROLL_PW&quot; | gcloud secrets create wazuh-enrollment-password \
+  --replication-policy=user-managed --locations=$REGION --data-file=-
+for SA in $SA_APISIX $SA_APP $SA_OBS; do
+  gcloud secrets add-iam-policy-binding wazuh-enrollment-password \
+    --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
+done
+</code></pre>
+<p>Set the same password in the manager (<code>authd.pass</code>, with <code>&lt;use_password&gt;yes&lt;/use_password&gt;</code> in the <code>&lt;auth&gt;</code> block).</p>
+<p>GCP log feed:</p>
+<pre><code class="language-bash">gcloud pubsub topics create wazuh-logs
+gcloud pubsub subscriptions create wazuh-logs-sub --topic=wazuh-logs
+gcloud logging sinks create wazuh-sink pubsub.googleapis.com/projects/$PROJECT_ID/topics/wazuh-logs \
+  --log-filter='logName:&quot;cloudaudit.googleapis.com&quot; OR resource.type=&quot;http_load_balancer&quot;'
+# grant the sink's writer identity roles/pubsub.publisher on the topic
+gcloud iam service-accounts create sa-wazuh-pubsub
+gcloud pubsub subscriptions add-iam-policy-binding wazuh-logs-sub \
+  --member=serviceAccount:sa-wazuh-pubsub@${PROJECT_ID}.iam.gserviceaccount.com --role=roles/pubsub.subscriber
+</code></pre>
+<p>Create a key for <code>sa-wazuh-pubsub</code>, store it as secret <code>wazuh-pubsub-key</code>, delete the local copy, mount it into the manager container, and add to the manager's <code>ossec.conf</code>:</p>
+<pre><code class="language-xml">&lt;gcp-pubsub&gt;
+  &lt;pull_on_start&gt;yes&lt;/pull_on_start&gt;
+  &lt;interval&gt;1m&lt;/interval&gt;
+  &lt;project_id&gt;PROJECT_ID&lt;/project_id&gt;
+  &lt;subscription_name&gt;wazuh-logs-sub&lt;/subscription_name&gt;
+  &lt;credentials_file&gt;/run/secrets/wazuh-pubsub.json&lt;/credentials_file&gt;
+&lt;/gcp-pubsub&gt;
+</code></pre>
+<p>Open the dashboard with <code>gcloud compute start-iap-tunnel vm-wazuh 443 --local-host-port=localhost:8443 --zone=$ZONE</code>.</p>
+<h3 id="11-cloud-armor-policy">11. Cloud Armor policy</h3>
+<pre><code class="language-bash">gcloud compute security-policies create waf-edge --type=CLOUD_ARMOR
+gcloud compute security-policies update waf-edge --enable-layer7-ddos-defense --json-parsing=STANDARD
+
+gcloud compute security-policies rules create 1000 --security-policy=waf-edge \
+  --expression=&quot;evaluatePreconfiguredWaf('sqli-v33-stable', {'sensitivity': 1})&quot; --action=deny-403 --preview
+gcloud compute security-policies rules create 1010 --security-policy=waf-edge \
+  --expression=&quot;evaluatePreconfiguredWaf('xss-v33-stable', {'sensitivity': 1})&quot; --action=deny-403 --preview
+# … repeat for lfi, rfi, rce, methodenforcement, protocolattack, scannerdetection, sessionfixation
+
+gcloud compute security-policies rules create 2000 --security-policy=waf-edge \
+  --expression=&quot;true&quot; --action=rate-based-ban \
+  --rate-limit-threshold-count=600 --rate-limit-threshold-interval-sec=60 --ban-duration-sec=300 \
+  --conform-action=allow --exceed-action=deny-429 --enforce-on-key=IP
+</code></pre>
+<h3 id="12-global-external-application-lb">12. Global external Application LB</h3>
+<pre><code class="language-bash">gcloud compute addresses create ip-api --global
+gcloud compute ssl-certificates create cert-api --domains=$DOMAIN --global
+gcloud compute ssl-policies create sslp-modern --profile=MODERN --min-tls-version=1.2
+
+gcloud compute backend-services create be-apisix --global \
+  --load-balancing-scheme=EXTERNAL_MANAGED --protocol=HTTP --port-name=http \
+  --health-checks=hc-apisix --enable-logging --logging-sample-rate=1.0 --security-policy=waf-edge
+gcloud compute backend-services add-backend be-apisix --global \
+  --instance-group=mig-apisix --instance-group-region=$REGION
+
+gcloud compute url-maps create um-api --default-service=be-apisix
+gcloud compute target-https-proxies create thps-api --url-map=um-api \
+  --ssl-certificates=cert-api --ssl-policy=sslp-modern
+gcloud compute forwarding-rules create fr-api-https --global \
+  --load-balancing-scheme=EXTERNAL_MANAGED --address=ip-api --target-https-proxy=thps-api --ports=443
+</code></pre>
+<p>For HTTP to HTTPS, create a second URL map whose default action is an <code>httpsRedirect</code>, a target HTTP proxy, and a forwarding rule on port 80 using the same <code>ip-api</code>.</p>
+<h3 id="13-dns-and-verification">13. DNS and verification</h3>
+<ol>
+<li>Point an A record for <code>$DOMAIN</code> at <code>ip-api</code>; the managed certificate turns <code>ACTIVE</code> once DNS resolves (often 15–60 minutes).</li>
+<li><code>curl -i https://$DOMAIN/healthz</code> returns 200.</li>
+<li>A call to <code>/api/orders/</code> without a JWT returns 401 from APISIX; with a valid JWT it returns the app's response.</li>
+<li><code>curl "https://$DOMAIN/api/orders/?id=1%27%20OR%201=1"</code> shows a <code>preview</code> match in Cloud Armor logs; after tuning, remove <code>--preview</code> and expect 403.</li>
+<li>Check the backend VMs have no external IP and SSH works only through <code>gcloud compute ssh --tunnel-through-iap</code>.</li>
+</ol>
+<p>Observability and security checks:</p>
+<ol>
+<li>In Grafana Explore, a <code>/api/orders/</code> request appears in Tempo as an APISIX span with a child app span, and "Logs for this span" opens the matching Loki lines (same <code>trace_id</code>).</li>
+<li>Prometheus shows <code>apisix_http_status</code> and host metrics for every VM; stop one app VM and confirm APISIX marks it unhealthy and traffic continues.</li>
+<li>The Wazuh dashboard lists every VM as an active agent; editing a file under <code>/opt/apisix</code> raises a file-integrity alert; a Cloud Armor block appears in Wazuh through the Pub/Sub feed.</li>
+</ol>
+<h2 id="operations">Operations</h2>
+<p>Every change ships as a new instance template rolled through the MIG; nobody edits a running VM.</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Practice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Deploy app</td>
+<td>CI builds image → pushes to Artifact Registry → creates <code>tpl-app-vN</code> with the new digest → <code>gcloud compute instance-groups managed rolling-action start-update mig-app --region=$REGION --version=template=tpl-app-vN --max-surge=0 --max-unavailable=1</code> (stateful MIGs replace in place, one VM at a time)</td>
+</tr>
+<tr>
+<td>Deploy gateway config</td>
+<td>CI validates <code>apisix.yaml</code> (run APISIX in a container and hit test routes), uploads to the bucket, then <code>rolling-action replace mig-apisix</code></td>
+</tr>
+<tr>
+<td>Scale app tier</td>
+<td>Add <code>app-4</code> at <code>10.10.2.14</code> and add the node to <code>apisix.yaml</code> in the same CI change</td>
+</tr>
+<tr>
+<td>Rollback</td>
+<td><code>start-update</code> back to the previous template; keep the last 3 templates</td>
+</tr>
+<tr>
+<td>Scaling gateway</td>
+<td>Autoscaler on CPU 60%, 2–6 VMs</td>
+</tr>
+<tr>
+<td>Dashboards</td>
+<td>Grafana: APISIX (requests, 4xx/5xx, p95 latency, upstream health), app RED metrics, host and Docker resources, Tempo service graph</td>
+</tr>
+<tr>
+<td>Alerts (Grafana)</td>
+<td>5xx &gt; 1% for 5 min; p95 &gt; 1 s; an APISIX upstream node unhealthy; disk &gt; 80% on any VM; collector export failures; no data from a VM for 10 min</td>
+</tr>
+<tr>
+<td>Alerts (Wazuh)</td>
+<td>Rule level ≥ 10 to the security channel: FIM changes on config paths, new critical CVEs, SCA failures, IAM changes and secret access by unexpected principals from audit logs</td>
+</tr>
+<tr>
+<td>Alerts (Cloud)</td>
+<td>Cloud Armor deny spike and Adaptive Protection alerts in Cloud Monitoring, as a backstop if the Grafana VM is down</td>
+</tr>
+<tr>
+<td>Ops stack health</td>
+<td>Grafana and Wazuh are single VMs: snapshot their disks daily; Loki and Tempo data is already in GCS; Wazuh indexer snapshots to GCS</td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>Data Access audit logs on for Secret Manager; audit logs to Wazuh and to a locked log bucket for retention</td>
+</tr>
+<tr>
+<td>Patching</td>
+<td>Rebuild the golden image monthly (or on critical CVEs, which Wazuh flags) and roll every group; pin and upgrade the Grafana stack and Wazuh images on a schedule</td>
+</tr>
+</tbody>
+</table>
+<h2 id="risks-and-open-decisions">Risks and open decisions</h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Impact</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>WAF false positives block real users</td>
+<td>Failed API calls after go-live</td>
+<td>Preview mode first, tune per-rule sensitivity, add rule exclusions for known fields</td>
+</tr>
+<tr>
+<td>App tier cannot autoscale</td>
+<td>Traffic spikes need a manual change</td>
+<td>Size for peak + headroom; adding a VM is a small CI change; move app onto the APISIX VMs or add an internal LB if autoscaling becomes a must</td>
+</tr>
+<tr>
+<td>APISIX upstream list drifts from real VMs</td>
+<td>Requests to a dead IP until health checks eject it</td>
+<td>Fixed IPs from the stateful MIG; one CI change updates both; alert on unhealthy upstream nodes</td>
+</tr>
+<tr>
+<td>Observability and Wazuh are single VMs</td>
+<td>Loss of dashboards or SIEM during an outage; telemetry gaps</td>
+<td>Disk snapshots, GCS-backed Loki/Tempo, Wazuh snapshots; Cloud Monitoring alerts as backstop; move to a 2-node setup later</td>
+</tr>
+<tr>
+<td>One keyed service account (Wazuh Pub/Sub)</td>
+<td>Key leak exposes the log feed</td>
+<td>Subscriber-only on one subscription, key in Secret Manager, 90-day rotation</td>
+</tr>
+<tr>
+<td>Telemetry unencrypted inside the VPC</td>
+<td>May fail an in-transit encryption check</td>
+<td>TLS on the OTLP receiver and agent exporter before production</td>
+</tr>
+<tr>
+<td>Single region</td>
+<td>Region outage takes the API down</td>
+<td>Accept for now; a second region adds another set of groups behind the same global LB</td>
+</tr>
+<tr>
+<td>Secrets fetched only at boot</td>
+<td>Rotation needs a rolling restart</td>
+<td>Rolling replace in the rotation runbook</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Open decisions</strong></p>
+<ul>
+<li><input type="checkbox" disabled> Region: Jakarta (<code>asia-southeast2</code>) or Singapore (<code>asia-southeast1</code>)</li>
+<li><input type="checkbox" disabled> App tier size and whether a fixed-size group is acceptable, or app containers should share the APISIX VMs</li>
+<li><input type="checkbox" disabled> Authentication at APISIX: <code>jwt-auth</code> with your own keys, or <code>openid-connect</code> against an IdP</li>
+<li><input type="checkbox" disabled> Encryption inside the VPC (APISIX to app, OTLP): required or not</li>
+<li><input type="checkbox" disabled> Retention for metrics, logs, traces and Wazuh alerts, set against your audit requirements</li>
+<li><input type="checkbox" disabled> Where Grafana and Wazuh alerts go (Slack, email, on-call tool)</li>
+<li><input type="checkbox" disabled> Infrastructure as code: turn these steps into Terraform modules before production</li>
+</ul>
+<p><a href="../">All designs</a></p>
+</body></html>
