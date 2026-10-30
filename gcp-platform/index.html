@@ -21,7 +21,7 @@
 <body>
 <h1 id="gcp-application-platform-design-lb-cloud-armor-apisix-vmdocker-secret-manager">GCP Application Platform Design — LB, Cloud Armor, APISIX, VM/Docker, Secret Manager</h1>
 <p class="meta">Updated 30 Oct 2026 · Design document</p>
-<nav><strong>Contents</strong><ol><li><a href="#overview">Overview</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#components">Components</a></li><li><a href="#observability-and-security-monitoring">Observability and security monitoring</a></li><li><a href="#network-design">Network design</a></li><li><a href="#security-design">Security design</a></li><li><a href="#implementation-steps">Implementation steps</a></li><li><a href="#operations">Operations</a></li><li><a href="#risks-and-open-decisions">Risks and open decisions</a></li></ol></nav>
+<nav><strong>Contents</strong><ol><li><a href="#overview">Overview</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#components">Components</a></li><li><a href="#observability-and-security-monitoring">Observability and security monitoring</a></li><li><a href="#network-design">Network design</a></li><li><a href="#security-design">Security design</a></li><li><a href="#implementation-steps">Implementation steps</a></li><li><a href="#operations">Operations</a></li><li><a href="#automated-image-updates-watchtower">Automated image updates (Watchtower)</a></li><li><a href="#risks-and-open-decisions">Risks and open decisions</a></li></ol></nav>
 <h2 id="overview">Overview</h2>
 <p>Internet traffic enters through one global external Application Load Balancer with Cloud Armor, reaches Apache APISIX on a private VM group, and APISIX proxies directly to the application containers on a second private VM group. No VM has a public IP. Every VM ships traces, metrics and logs through OpenTelemetry to a self-hosted Grafana stack (Prometheus, Loki, Tempo), and runs a Wazuh agent that reports to a Wazuh SIEM. Secrets live only in Secret Manager and are read with each VM's own service account.</p>
 <p><strong>Scope:</strong> one GCP project, one region, HTTPS APIs served from Docker containers on Compute Engine VMs.</p>
@@ -94,11 +94,11 @@
 </tbody>
 </table>
 <h2 id="architecture">Architecture</h2>
-<figure><a href="diagram.html"><img src="architecture.png" alt="GCP architecture: Cloud Armor and global LB at the edge; APISIX, app, observability and Wazuh VMs in a private VPC; Secret Manager and Artifact Registry as managed services"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
+<figure><a href="diagram.html"><img src="architecture.png" alt="GCP architecture with Watchtower on the app VMs"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
 <p><strong>Request path.</strong> Client → HTTPS 443 on the global LB → Cloud Armor evaluates the request at Google's edge → LB forwards to an APISIX VM on port 9080 → APISIX checks auth and rate limits, then load-balances across the app VMs on <code>10.10.2.11</code>–<code>.13:8080</code>.</p>
 <p><strong>Telemetry path.</strong> APISIX and the app send traces over OTLP to the OpenTelemetry Collector on their own VM, which also scrapes Prometheus metrics and tails Docker logs. It forwards everything to the gateway collector on the observability VM, which writes metrics to Prometheus, logs to Loki and traces to Tempo. Grafana reads all three.</p>
 <p><strong>Security path.</strong> The Wazuh agent on every VM sends events to the Wazuh manager on 1514/tcp. Cloud Logging (audit, LB and Cloud Armor logs) reaches Wazuh through a log sink and Pub/Sub.</p>
-<p><strong>Boot.</strong> Each VM reads its secrets from Secret Manager and pulls its image from Artifact Registry over Private Google Access. Cloud NAT and IAP are not drawn.</p>
+<p><strong>Boot.</strong> Each VM reads its secrets from Secret Manager and pulls its image from Artifact Registry over Private Google Access; on app VMs, Watchtower keeps checking every 5 minutes for a new app:prod image. Cloud NAT and IAP are not drawn.</p>
 <h2 id="components">Components</h2>
 <p>The first five rows carry the request path; the rest observe, protect and support it.</p>
 <table>
@@ -133,7 +133,7 @@
 <tr>
 <td>Application</td>
 <td>Stateful regional MIG <code>mig-app</code>, 3 VMs at fixed IPs <code>10.10.2.11</code>–<code>.13</code></td>
-<td>App containers in Docker; image from Artifact Registry by digest; APISIX upstream with active health checks on <code>/healthz</code></td>
+<td>App containers in Docker; image app:prod from Artifact Registry, kept current by Watchtower; APISIX upstream with active health checks on <code>/healthz</code></td>
 </tr>
 <tr>
 <td>Observability</td>
@@ -651,7 +651,7 @@ gcloud compute instance-groups managed set-autoscaling mig-apisix --region=$REGI
 </code></pre>
 <p>Build one golden image (Packer) for every VM: Ubuntu LTS, Docker Engine, <code>otelcol-contrib</code> with the agent config from step 9, and the Wazuh agent pinned to the manager's version (installed, not started). Faster scale-out, no dependency on package mirrors at boot, and every VM is watched from its first minute.</p>
 <h3 id="8-app-tier-stateful-mig-with-fixed-ips">8. App tier: stateful MIG with fixed IPs</h3>
-<p>The app VMs use the same golden image; <code>startup-app.sh</code> starts the Wazuh agent and collector exactly as in step 7, fetches <code>db-password</code>, and runs the app image from Artifact Registry by digest, publishing port 8080 and pointing its OTel SDK at <code>http://127.0.0.1:4318</code>.</p>
+<p>The app VMs use the same golden image; <code>startup-app.sh</code> starts the Wazuh agent and collector exactly as in step 7, fetches <code>db-password</code>, and runs the app image app:prod from Artifact Registry with the Watchtower label and starts Watchtower (see Automated image updates), publishing port 8080 and pointing its OTel SDK at <code>http://127.0.0.1:4318</code>.</p>
 <pre><code class="language-bash">gcloud compute instance-templates create tpl-app-v1 --machine-type=e2-standard-2 \
   --region=$REGION --subnet=snet-app --no-address \
   --service-account=$SA_APP --scopes=cloud-platform \
@@ -875,7 +875,7 @@ gcloud compute forwarding-rules create fr-api-https --global \
 <tbody>
 <tr>
 <td>Deploy app</td>
-<td>CI builds image → pushes to Artifact Registry → creates <code>tpl-app-vN</code> with the new digest → <code>gcloud compute instance-groups managed rolling-action start-update mig-app --region=$REGION --version=template=tpl-app-vN --max-surge=0 --max-unavailable=1</code> (stateful MIGs replace in place, one VM at a time)</td>
+<td>App releases: CI moves the app:prod tag after approval and Watchtower rolls it out (see Automated image updates). Image or startup-script changes: CI builds → creates <code>tpl-app-vN</code> with the new digest → <code>gcloud compute instance-groups managed rolling-action start-update mig-app --region=$REGION --version=template=tpl-app-vN --max-surge=0 --max-unavailable=1</code> (stateful MIGs replace in place, one VM at a time)</td>
 </tr>
 <tr>
 <td>Deploy gateway config</td>
@@ -920,6 +920,162 @@ gcloud compute forwarding-rules create fr-api-https --global \
 <tr>
 <td>Patching</td>
 <td>Rebuild the golden image monthly (or on critical CVEs, which Wazuh flags) and roll every group; pin and upgrade the Grafana stack and Wazuh images on a schedule</td>
+</tr>
+</tbody>
+</table>
+<h2 id="automated-image-updates-watchtower">Automated image updates (Watchtower)</h2>
+<p>Watchtower runs on each app VM, checks Artifact Registry every 5 minutes, and restarts the app container when the <code>app:prod</code> tag points to a new image; CI decides what reaches production by moving that tag, and the VMs update one at a time so the app tier never restarts all at once.</p>
+<p><strong>Which Watchtower:</strong> the original <code>containrrr/watchtower</code> was archived on 17 December 2025 and no longer gets security fixes. Use the maintained, drop-in compatible fork <code>nickfedor/watchtower</code> (also <code>ghcr.io/nicholas-fedor/watchtower</code>), pinned to a release and mirrored into your own Artifact Registry (a remote repository) instead of pulled from Docker Hub at boot.</p>
+<h3 id="how-a-release-flows">How a release flows</h3>
+<ol>
+<li>CI builds the app image and pushes <code>app:&lt;git-sha&gt;</code>; vulnerability scanning runs in Artifact Registry.</li>
+<li>After tests pass and the release is approved (GitHub environment protection), the CI deployer moves the production tag: <code>gcloud artifacts docker tags add $REGION-docker.pkg.dev/$PROJECT_ID/apps/app@sha256:&lt;digest&gt; $REGION-docker.pkg.dev/$PROJECT_ID/apps/app:prod</code>.</li>
+<li>Each app VM's Watchtower checks on its own staggered schedule (app-1 at minute 0, 5, 10…; app-2 two minutes later; app-3 four minutes later), sees the new digest behind <code>:prod</code>, pulls it, stops the old container and starts the new one with the same settings, then removes the old image.</li>
+<li>During each restart APISIX's active health checks take that VM out of rotation within seconds; the other two keep serving.</li>
+<li><strong>Rollback</strong> = move <code>:prod</code> back to the previous digest; every VM follows within one cycle.</li>
+</ol>
+<h3 id="what-watchtower-manages">What Watchtower manages</h3>
+<table>
+<thead>
+<tr>
+<th>Container</th>
+<th>Updated by Watchtower</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>App containers on <code>mig-app</code></td>
+<td>Yes (label <code>com.centurylinklabs.watchtower.enable=true</code>)</td>
+<td>Frequent releases; health-checked behind APISIX</td>
+</tr>
+<tr>
+<td>APISIX on <code>mig-apisix</code></td>
+<td>No</td>
+<td>Gateway changes ship as new instance templates through the MIG rolling update</td>
+</tr>
+<tr>
+<td>OTel Collector, Wazuh agent</td>
+<td>No</td>
+<td>Installed in the golden image</td>
+</tr>
+<tr>
+<td>Observability stack, Wazuh manager</td>
+<td>No</td>
+<td>Upgraded deliberately; stateful</td>
+</tr>
+<tr>
+<td>Watchtower itself</td>
+<td>No</td>
+<td>Pinned; upgraded with the golden image</td>
+</tr>
+<tr>
+<td>Binance execution service (Platform Design v2)</td>
+<td><strong>Never</strong></td>
+<td>Only signed images you approved may run there</td>
+</tr>
+</tbody>
+</table>
+<h3 id="configuration-on-each-app-vm">Configuration on each app VM</h3>
+<p>Add to <code>startup-app.sh</code> (after the Wazuh and collector steps):</p>
+<pre><code class="language-bash"># 1. Registry credentials for Watchtower, refreshed every 30 minutes (tokens last about 1 hour)
+cat &gt; /usr/local/bin/ar-token.sh &lt;&lt;'EOF'
+#!/bin/bash
+set -euo pipefail
+TOKEN=$(curl -s -H 'Metadata-Flavor: Google' \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token)
+AUTH=$(printf 'oauth2accesstoken:%s' &quot;$TOKEN&quot; | base64 -w0)
+umask 077
+printf '{&quot;auths&quot;:{&quot;REGION-docker.pkg.dev&quot;:{&quot;auth&quot;:&quot;%s&quot;}}}' &quot;$AUTH&quot; &gt; /etc/watchtower/config.json.tmp
+mv /etc/watchtower/config.json.tmp /etc/watchtower/config.json
+EOF
+chmod 700 /usr/local/bin/ar-token.sh &amp;&amp; mkdir -p /etc/watchtower &amp;&amp; /usr/local/bin/ar-token.sh
+# systemd timer (OnUnitActiveSec=30min) runs ar-token.sh; unit files omitted for brevity
+
+# 2. App container follows the moving :prod tag and opts in to Watchtower
+docker run -d --name app --restart=always -p 8080:8080 \
+  --label com.centurylinklabs.watchtower.enable=true \
+  --env-file /run/secrets/app.env --read-only --security-opt no-new-privileges \
+  REGION-docker.pkg.dev/PROJECT_ID/apps/app:prod
+
+# 3. Watchtower, staggered by instance number (app-1 -&gt; 0, app-2 -&gt; 2, app-3 -&gt; 4)
+N=$(hostname | grep -o '[0-9]*$'); OFFSET=$(( (N - 1) * 2 % 5 ))
+docker run -d --name watchtower --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /etc/watchtower/config.json:/config.json:ro \
+  -e WATCHTOWER_LABEL_ENABLE=true \
+  -e WATCHTOWER_CLEANUP=true \
+  -e WATCHTOWER_SCHEDULE=&quot;0 ${OFFSET}/5 * * * *&quot; \
+  -e WATCHTOWER_NOTIFICATION_URL=&quot;$(gcloud secrets versions access latest --secret=watchtower-notify-url)&quot; \
+  -e WATCHTOWER_HTTP_API_METRICS=true \
+  -e WATCHTOWER_HTTP_API_TOKEN=&quot;$(gcloud secrets versions access latest --secret=watchtower-api-token)&quot; \
+  -p 127.0.0.1:8081:8080 \
+  REGION-docker.pkg.dev/PROJECT_ID/mirror/nickfedor/watchtower@sha256:&lt;pinned-digest&gt;
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li>The schedule uses Watchtower's six-field cron (seconds first). The offsets keep the three app VMs from restarting together.</li>
+<li>Registry traffic goes to <code>REGION-docker.pkg.dev</code> over Private Google Access; no firewall or NAT change is needed. <code>sa-app</code> already has <code>artifactregistry.reader</code> on the repository.</li>
+<li>Watchtower needs the Docker socket, which is root-equivalent on the host. Keep its image pinned by digest from your mirror, and add <code>/etc/watchtower</code> and the Watchtower container to Wazuh file integrity monitoring.</li>
+<li>The OTel Collector scrapes Watchtower's metrics on <code>127.0.0.1:8081/v1/metrics</code> (bearer token) for Grafana: containers scanned, updated, failed. Notifications (Slack, Teams, email) go through its built-in notification URL.</li>
+<li>The instance template's startup script runs <code>app:prod</code>, so a VM recreated by autohealing starts on the current production image.</li>
+</ul>
+<h3 id="controls-that-change">Controls that change</h3>
+<p>This replaces "every app release is a new instance template rolled through the MIG" with "every app release is a tag move". The control point moves accordingly:</p>
+<table>
+<thead>
+<tr>
+<th>Control</th>
+<th>With Watchtower</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Who can deploy</td>
+<td>Whoever can move <code>app:prod</code>. Grant <code>artifactregistry.writer</code> on the <code>apps</code> repository only to the CI deployer identity, and run the tag move in a CI job that requires approval</td>
+</tr>
+<tr>
+<td>What can be deployed</td>
+<td>Only images that passed CI tests and have no critical findings in Artifact Registry vulnerability scanning; the promotion job checks this before moving the tag</td>
+</tr>
+<tr>
+<td>Change record</td>
+<td>The promotion job links the change ticket and records old and new digests; Artifact Registry audit logs record the tag update</td>
+</tr>
+<tr>
+<td>Reproducibility</td>
+<td>VMs run whatever <code>:prod</code> points to; the digest each VM actually runs is visible in Watchtower notifications and <code>docker inspect</code>, and Grafana shows when each VM switched</td>
+</tr>
+<tr>
+<td>Prod safety option</td>
+<td>If auto-update in production is not acceptable to your change-management policy, run Watchtower with <code>WATCHTOWER_MONITOR_ONLY=true</code> in production (notify only) and auto-update in staging</td>
+</tr>
+</tbody>
+</table>
+<h3 id="risks-of-this-approach">Risks of this approach</h3>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A bad image reaches all VMs</td>
+<td>Staggered schedule; watch the first VM's health before the next restarts (5-minute spacing gives time to move the tag back); rollback by tag</td>
+</tr>
+<tr>
+<td>Tag moved by the wrong person or a compromised CI identity</td>
+<td>Writer role only on the CI deployer; approval-gated promotion job; alert on any tag change made outside that job</td>
+</tr>
+<tr>
+<td>Watchtower bug or compromise (Docker socket access)</td>
+<td>Maintained fork, pinned digest from your mirror, no inbound access except localhost metrics, Wazuh monitoring</td>
+</tr>
+<tr>
+<td>Registry token expiry stops updates silently</td>
+<td>Timer refreshes every 30 minutes; alert when Watchtower reports registry auth failures or no successful scan for 30 minutes</td>
 </tr>
 </tbody>
 </table>
