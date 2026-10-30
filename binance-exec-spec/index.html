@@ -1,0 +1,2204 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow">
+<title>Binance Execution Service — Engineering Specification</title>
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 60rem; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+  a { color: #0b5fff; }
+  h1 { line-height: 1.25; } h2 { margin-top: 2.5rem; border-bottom: 1px solid #e5e5e5; padding-bottom: .3rem; } h3 { margin-top: 1.8rem; }
+  .meta { color: #666; margin-top: -.5rem; }
+  nav { background: #f6f7f9; border: 1px solid #e5e7eb; border-radius: 6px; padding: .8rem 1.2rem; margin: 1.5rem 0; }
+  nav ol { margin: .4rem 0 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #e5e7eb; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #f6f7f9; }
+  code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; padding: .1em .3em; border-radius: 3px; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 6px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; padding: 0; color: inherit; }
+  figure { margin: 1.5rem 0; } figure img { width: 100%; border: 1px solid #e5e7eb; border-radius: 6px; }
+  figcaption { color: #666; font-size: .85rem; }
+  li input[type=checkbox] { margin-right: .4rem; }
+</style></head>
+<body>
+<h1 id="binance-execution-service-engineering-specification">Binance Execution Service — Engineering Specification</h1>
+<p class="meta">Engineering specification · Updated 30 Oct 2026 · Infrastructure: <a href="../gcp-platform-v2/">Platform Design v2</a></p>
+<nav><strong>Contents</strong><ol><li><a href="#purpose-and-traceability">Purpose and traceability</a></li><li><a href="#system-context-and-responsibilities">System context and responsibilities</a></li><li><a href="#end-to-end-flow">End-to-end flow</a></li><li><a href="#payment-instruction">Payment instruction</a></li><li><a href="#internal-api">Internal API</a></li><li><a href="#webauthn">WebAuthn</a></li><li><a href="#approval-screen">Approval screen</a></li><li><a href="#policy">Policy</a></li><li><a href="#execution-state-machine">Execution state machine</a></li><li><a href="#binance-integration">Binance integration</a></li><li><a href="#database-schema">Database schema</a></li><li><a href="#audit-events">Audit events</a></li><li><a href="#approver-and-passkey-administration">Approver and Passkey administration</a></li><li><a href="#security-controls-checklist">Security controls checklist</a></li><li><a href="#build-deploy-and-configuration">Build, deploy and configuration</a></li><li><a href="#observability">Observability</a></li><li><a href="#test-plan">Test plan</a></li><li><a href="#runbooks">Runbooks</a></li><li><a href="#work-breakdown">Work breakdown</a></li><li><a href="#open-questions-and-sources">Open questions and sources</a></li></ol></nav>
+<h2 id="purpose-and-traceability">Purpose and traceability</h2>
+<p>This specification tells engineering exactly what to build so that Binance funding requests run only through a dedicated execution service that verifies ops Passkey approvals itself. Every requirement in "Refactor the Binance sending process" maps to a design element and a test below. Infrastructure (projects, network, IAM) is in <a href="https://vika-researchpersonal.github.io/design-mausbot/gcp-platform-v2/">Platform Design v2</a>; this document covers the service.</p>
+<p><strong>Scope:</strong> the execution service (internal API, approval UI, WebAuthn verifier, policy engine, executor, reconciliation worker, audit writer, admin UI), its database, its Binance client, the TMS changes, and removal of the old path. <strong>Out of scope:</strong> TMS business logic, Binance account setup beyond API keys and whitelists.</p>
+<p><strong>Terms:</strong> <em>instruction</em> = immutable payment order with a version; <em>approval request</em> = instruction hash plus nonce, expiry, operator; <em>approval</em> = verified WebAuthn assertion over one approval request; <em>execution</em> = the single Binance attempt for a payment UUID.</p>
+<h3 id="requirement-traceability-matrix">Requirement traceability matrix</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Requirement (source section)</th>
+<th>Design element (this spec)</th>
+<th>Verified by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R1.1</td>
+<td>Approval covers an immutable instruction with all listed fields (1)</td>
+<td>Payment instruction schema</td>
+<td>T-CAN-01..06, AT-01</td>
+</tr>
+<tr>
+<td>R1.2</td>
+<td>Deterministic serialization; any change voids approvals (1)</td>
+<td>RFC 8785 canonicalization, versioning</td>
+<td>T-CAN-07, AT-01</td>
+</tr>
+<tr>
+<td>R2.1</td>
+<td>Service creates the challenge bound to the instruction hash (2)</td>
+<td>WebAuthn → challenge derivation</td>
+<td>T-WA-01</td>
+</tr>
+<tr>
+<td>R2.2</td>
+<td>Service verifies challenge, origin, RP ID, signature, UV, operator authorization (2)</td>
+<td>WebAuthn → verification algorithm</td>
+<td>T-WA-02..09</td>
+</tr>
+<tr>
+<td>R2.3</td>
+<td>No trust in an "approved" flag; execute the stored instruction, not a mutable record (2)</td>
+<td>Internal API (no approval fields), executor reads <code>canonical_json</code> only</td>
+<td>AT-08, T-EXE-03</td>
+</tr>
+<tr>
+<td>R3.1</td>
+<td>Exact details shown before approval, on a separate origin in the trust boundary (3)</td>
+<td>Approval screen specification</td>
+<td>T-UI-01..05</td>
+</tr>
+<tr>
+<td>R4.1</td>
+<td>Approvals expire and are single use (4)</td>
+<td>Challenge table, consume-once update</td>
+<td>AT-02, AT-03</td>
+</tr>
+<tr>
+<td>R4.2</td>
+<td>Atomic reservation, durable state (4)</td>
+<td>State machine, <code>executions</code> primary key</td>
+<td>AT-05, T-EXE-01..02</td>
+</tr>
+<tr>
+<td>R4.3</td>
+<td>Duplicate protection by payment UUID across retries, concurrency, multiple approvals (4)</td>
+<td><code>executions.tms_payment_uuid</code> PK, reserve guard</td>
+<td>AT-05, T-EXE-05</td>
+</tr>
+<tr>
+<td>R4.4</td>
+<td>Reconcile uncertain outcomes; timeout ≠ failure (4)</td>
+<td>Binance integration → reconciliation</td>
+<td>AT-09, AT-10</td>
+</tr>
+<tr>
+<td>R5.1</td>
+<td>Only this service accesses Binance credentials; old paths removed, keys rotated (5)</td>
+<td>Security checklist SC-01..06, SC-19, SC-21; work breakdown E9</td>
+<td>SEC-01..03</td>
+</tr>
+<tr>
+<td>R5.2</td>
+<td>Narrow authenticated API; no arbitrary endpoints or forwarding (5)</td>
+<td>Internal API, fixed Binance endpoint allowlist</td>
+<td>T-API-05, SEC-04</td>
+</tr>
+<tr>
+<td>R5.3</td>
+<td>Policy: accounts, destinations, limits, thresholds, dual approval by distinct operators (5)</td>
+<td>Policy specification</td>
+<td>AT-06, AT-07, T-POL-01..08</td>
+</tr>
+<tr>
+<td>R5.4</td>
+<td>Minimal network, dependencies, runtime permissions, key permissions (5)</td>
+<td>Security checklist SC-07..14</td>
+<td>SEC-05..08</td>
+</tr>
+<tr>
+<td>R6.1</td>
+<td>Passkey enrollment, replacement, recovery, role changes via a separate audited process (6)</td>
+<td>Passkey and approver administration</td>
+<td>T-ADM-01..05</td>
+</tr>
+<tr>
+<td>R6.2</td>
+<td>Production deploy and policy changes under your control; builds have no prod credentials (6)</td>
+<td>Build, deploy and configuration management</td>
+<td>SEC-09..10</td>
+</tr>
+<tr>
+<td>R7.1</td>
+<td>Audit of instruction, hash, approvers, times, verification, policy, attempts, Binance refs; no secrets (7)</td>
+<td>Audit events</td>
+<td>T-AUD-01..04</td>
+</tr>
+<tr>
+<td>R7.2</td>
+<td>Audit stored off the execution server with restricted modification (7)</td>
+<td>Locked bucket in <code>prj-audit</code>, hash chain</td>
+<td>T-AUD-05, SEC-11</td>
+</tr>
+<tr>
+<td>AC-1</td>
+<td>Reject modified details after approval</td>
+<td>Versioning + hash check at verify and reserve</td>
+<td>AT-01</td>
+</tr>
+<tr>
+<td>AC-2</td>
+<td>Reject expired, replayed, unauthorized approvals</td>
+<td>Challenge TTL, consume-once, operator check</td>
+<td>AT-02, AT-03, AT-04</td>
+</tr>
+<tr>
+<td>AC-3</td>
+<td>Reject duplicate or concurrent execution</td>
+<td>Reserve guard + PK</td>
+<td>AT-05</td>
+</tr>
+<tr>
+<td>AC-4</td>
+<td>Reject threshold or policy bypass</td>
+<td>Policy at create, quorum, re-check at reserve</td>
+<td>AT-06, AT-07</td>
+</tr>
+<tr>
+<td>AC-5</td>
+<td>Reject backend requests carrying only an approval flag</td>
+<td>Strict request schema, no approval endpoint for TMS</td>
+<td>AT-08</td>
+</tr>
+<tr>
+<td>AC-6</td>
+<td>Safe recovery after timeout or restart without blind resend</td>
+<td><code>SENDING</code> written before call; reconciliation</td>
+<td>AT-09, AT-10</td>
+</tr>
+</tbody>
+</table>
+<p>AT-11 (approval forged in the database), AT-12 (daily-limit race) and AT-13 (revocation and two-person rule) additionally cover AC-2, AC-3 and AC-4 and requirements R5.3 and R6.1.</p>
+<h2 id="system-context-and-responsibilities">System context and responsibilities</h2>
+<p>TMS decides <em>what</em> should be paid; the execution service decides <em>whether</em> it may be paid and is the only thing that can pay it.</p>
+<table>
+<thead>
+<tr>
+<th>Actor</th>
+<th>Owns</th>
+<th>Must never</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TMS / main backend</td>
+<td>Business payment request, its UUID, business status shown to users</td>
+<td>Hold Binance credentials, call Binance, mark anything approved, modify an instruction after submit</td>
+</tr>
+<tr>
+<td>Execution service</td>
+<td>Instruction store, approvals, policy decisions, execution state, Binance calls, audit records</td>
+<td>Accept approval state from callers, forward arbitrary requests, log secrets</td>
+</tr>
+<tr>
+<td>Ops approver</td>
+<td>Reviewing and approving instructions with their Passkey</td>
+<td>Approve from any screen other than <code>approve.&lt;domain&gt;</code>; share or export Passkeys</td>
+</tr>
+<tr>
+<td>You (service owner)</td>
+<td>Production deploys, policy changes, approver roster and manual failure decisions (each together with the security officer under the two-person rule), Binance key creation and rotation, break-glass</td>
+<td>Share break-glass credentials; approve your own policy change without review (use a second reviewer where possible)</td>
+</tr>
+<tr>
+<td>Binance</td>
+<td>Settlement</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-changes-in-tms">What changes in TMS</h3>
+<ol>
+<li>Replace every direct Binance call with <code>POST /v1/instructions</code> to the execution service.</li>
+<li>Store the returned <code>instruction_id</code>, <code>version</code> and <code>instruction_hash</code> against the payment.</li>
+<li>Read results with <code>GET /v1/instructions/{id}</code> (poll every 10 s while not terminal, then stop). Map states: <code>CONFIRMED</code> → paid; <code>FAILED</code>, <code>EXPIRED</code>, <code>CANCELLED</code>, <code>BLOCKED_BY_POLICY</code> → not paid (a new version may be submitted); <code>SUPERSEDED</code> → follow the newer version; <code>PENDING_APPROVAL</code>, <code>APPROVED</code>, <code>RESERVED</code>, <code>SENDING</code>, <code>ACCEPTED</code> → in progress; <code>UNKNOWN</code>, <code>MANUAL_REVIEW</code> → pending, show "being verified".</li>
+<li>If business data changes before execution, submit again with the same <code>tms_payment_uuid</code> and <code>version + 1</code>; the service supersedes older versions that are not yet reserved.</li>
+<li>Delete the old Binance client code, configuration and secrets; remove the Binance SDK dependency from the main backend build.</li>
+</ol>
+<h3 id="what-the-execution-service-is-not">What the execution service is not</h3>
+<ul>
+<li>Not a general Binance gateway: only the operations in the policy file, only the endpoints in the Binance integration section.</li>
+<li>Not a ledger: TMS remains the business system of record; the service is the record for approvals and executions.</li>
+<li>Not reachable from the internet except the approval origin, and that only through IAP and Cloud Armor.</li>
+</ul>
+<h3 id="process-separation-inside-the-execution-project">Process separation inside the execution project</h3>
+<p>The service runs as three processes, each with its own service account and database role, so that a bug in the internet-facing code cannot reach the Binance key, and the code holding the key accepts no inbound connections.</p>
+<table>
+<thead>
+<tr>
+<th>Process</th>
+<th>Listens on</th>
+<th>Service account</th>
+<th>Can access</th>
+<th>Cannot access</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exec-web</code></td>
+<td>Internal API (PSC, mTLS) and approval UI (<code>approve.&lt;domain&gt;</code>)</td>
+<td><code>sa-exec-web</code></td>
+<td>DB role <code>exec_web</code>; mTLS keys</td>
+<td>Binance secret, admin tables</td>
+</tr>
+<tr>
+<td><code>exec-worker</code></td>
+<td>Nothing (no inbound port except a local health endpoint)</td>
+<td><code>sa-exec-worker</code></td>
+<td>DB role <code>exec_worker</code>; Binance secret; audit bucket (create only); Binance API egress</td>
+<td>Approval UI, admin tables</td>
+</tr>
+<tr>
+<td><code>exec-admin</code></td>
+<td>Admin UI on <code>exec-admin.&lt;domain&gt;</code> (separate hostname, separate LB backend, IAP limited to admins)</td>
+<td><code>sa-exec-admin</code></td>
+<td>DB role <code>exec_admin</code></td>
+<td>Binance secret, approvals insert, credentials insert</td>
+</tr>
+</tbody>
+</table>
+<p>This refines the single "execution service" box in Platform Design v2: <code>exec-web</code>, <code>exec-worker</code> and <code>exec-admin</code> run in three separate instance groups (<code>mig-exec-web</code>, <code>mig-exec-worker</code>, <code>mig-exec-admin</code>), so each VM carries only its own service account.</p>
+<h2 id="end-to-end-flow">End-to-end flow</h2>
+<p>Ops approve a hash of the exact stored instruction; the service verifies it, reserves the payment, sends one request to Binance, and reconciles by order ID whenever the outcome is uncertain.</p>
+<figure><a href="diagram-sequence.html"><img src="sequence.png" alt="Approval and execution sequence"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
+<p>After <code>ACCEPTED</code>, the reconciliation worker polls withdrawal history until Binance reports a final status, and TMS reads the result through <code>GET /v1/instructions/{id}</code>. With dual approval, steps from "GET /i/{id}" to "POST assertion" happen once per approver.</p>
+<h2 id="payment-instruction">Payment instruction</h2>
+<p>An instruction is a flat JSON object whose canonical bytes are hashed once at creation and never change; every approval and the executor work from those stored bytes.</p>
+<h3 id="schema-binance-execinstructionv1">Schema (<code>binance-exec/instruction/v1</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Validation</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>schema</code></td>
+<td>string</td>
+<td>equals <code>binance-exec/instruction/v1</code></td>
+<td>Set by the service</td>
+</tr>
+<tr>
+<td><code>tms_payment_uuid</code></td>
+<td>string</td>
+<td>lowercase RFC 4122 UUID</td>
+<td>Duplicate-protection key</td>
+</tr>
+<tr>
+<td><code>version</code></td>
+<td>integer</td>
+<td>≥ 1; equals previous max + 1 for this UUID</td>
+<td>New version supersedes older unreserved ones</td>
+</tr>
+<tr>
+<td><code>operation</code></td>
+<td>string</td>
+<td>in policy <code>operations</code></td>
+<td><code>WITHDRAW</code> initially</td>
+</tr>
+<tr>
+<td><code>source_account</code></td>
+<td>string</td>
+<td>in policy <code>source_accounts</code></td>
+<td>Logical name chosen by TMS</td>
+</tr>
+<tr>
+<td><code>binance_account_id</code></td>
+<td>string</td>
+<td>resolved by the service from policy at create time</td>
+<td><strong>Set by the service</strong>; the actual Binance account that pays. Approval covers it</td>
+</tr>
+<tr>
+<td><code>wallet_type</code></td>
+<td>integer</td>
+<td><code>0</code> (spot) or <code>1</code> (funding), resolved from policy at create time</td>
+<td><strong>Set by the service</strong>; sent to Binance as <code>walletType</code>. Approval covers it</td>
+</tr>
+<tr>
+<td><code>asset</code></td>
+<td>string</td>
+<td><code>^[A-Z0-9]{2,15}$</code>, in policy for that account</td>
+<td></td>
+</tr>
+<tr>
+<td><code>amount</code></td>
+<td>string</td>
+<td>canonical decimal (rules below); &gt; 0; scale ≤ asset precision in policy</td>
+<td>Never a JSON number</td>
+</tr>
+<tr>
+<td><code>beneficiary_address</code></td>
+<td>string</td>
+<td>1–128 printable ASCII, no whitespace; matches the network's address regex in policy</td>
+<td>Leading/trailing space is rejected, not trimmed</td>
+</tr>
+<tr>
+<td><code>network</code></td>
+<td>string</td>
+<td>in policy for that asset</td>
+<td>Binance network code</td>
+</tr>
+<tr>
+<td><code>memo</code></td>
+<td>string</td>
+<td><code>""</code> or 1–128 printable ASCII; required when the network's policy says <code>memo_required: true</code></td>
+<td>Always present</td>
+</tr>
+<tr>
+<td><code>environment</code></td>
+<td>string</td>
+<td>equals the service's configured environment</td>
+<td>Set by the service</td>
+</tr>
+<tr>
+<td><code>service_id</code></td>
+<td>string</td>
+<td>equals <code>binance-exec</code></td>
+<td>Set by the service</td>
+</tr>
+</tbody>
+</table>
+<p>Unknown fields are rejected (<code>additionalProperties: false</code>). TMS supplies <code>tms_payment_uuid</code>, <code>version</code>, <code>operation</code>, <code>source_account</code>, <code>asset</code>, <code>amount</code>, <code>beneficiary_address</code>, <code>network</code>, <code>memo</code>, and optionally <code>tms_creator_id</code> (stored next to the instruction, <strong>not</strong> in the canonical bytes, and advisory only because TMS controls it). The service sets the rest. There is no timestamp inside the canonical bytes, so an identical retry produces identical bytes; <code>created_at</code> is a database column.</p>
+<p>At reserve time the executor resolves <code>source_account</code> against the current policy again; if <code>binance_account_id</code> or <code>wallet_type</code> would differ, the instruction goes to <code>BLOCKED_BY_POLICY</code> and needs a new version.</p>
+<h3 id="canonical-decimal">Canonical decimal</h3>
+<ul>
+<li>Regex: <code>^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$</code>.</li>
+<li>No sign, exponent, leading zeros, trailing fractional zeros, or bare trailing dot.</li>
+<li><code>"1250.5"</code> valid; <code>"1250.50"</code>, <code>"01250.5"</code>, <code>"1.25e3"</code>, <code>"1250."</code> rejected with <code>invalid_amount</code>. Rejection (not normalization) means TMS and the service can never disagree on the value.</li>
+<li>Arithmetic (limits, sums) uses a decimal type, never floating point.</li>
+</ul>
+<h3 id="canonical-serialization-and-hash">Canonical serialization and hash</h3>
+<ul>
+<li>JSON Canonicalization Scheme, RFC 8785: keys sorted by UTF-16 code units, no whitespace, strings with minimal escaping, integers as plain digits. With the restricted character sets above, this equals sorted-key compact JSON.</li>
+<li><code>instruction_hash = SHA-256(utf8(canonical_json))</code>, stored as 32 bytes, shown as lowercase hex.</li>
+<li>Store <code>canonical_json</code> bytes as received from the canonicalizer. Never re-serialize from parsed fields for hashing or execution.</li>
+</ul>
+<h3 id="approval-request-binance-execapproval-requestv1">Approval request (<code>binance-exec/approval-request/v1</code>)</h3>
+<p>Created by the service for one operator and one instruction version when they press Approve.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>schema</code></td>
+<td><code>binance-exec/approval-request/v1</code></td>
+</tr>
+<tr>
+<td><code>instruction_hash</code></td>
+<td>Hex hash of the instruction being approved</td>
+</tr>
+<tr>
+<td><code>operator_id</code></td>
+<td>Approver's stable ID</td>
+</tr>
+<tr>
+<td><code>approval_nonce</code></td>
+<td>32 bytes from a CSPRNG, base64url without padding</td>
+</tr>
+<tr>
+<td><code>approval_expires_at</code></td>
+<td>Now + 300 s, RFC 3339 UTC</td>
+</tr>
+<tr>
+<td><code>environment</code>, <code>service_id</code></td>
+<td>As in the instruction</td>
+</tr>
+<tr>
+<td><code>rp_id</code></td>
+<td><code>approve.&lt;domain&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>challenge = SHA-256(utf8(canonical(approval_request)))</code>, passed to WebAuthn as the 32-byte challenge.</p>
+<h3 id="test-vectors">Test vectors</h3>
+<p>Instruction (example values; the address is not real):</p>
+<pre><code class="language-json">{&quot;amount&quot;:&quot;1250.5&quot;,&quot;asset&quot;:&quot;USDT&quot;,&quot;beneficiary_address&quot;:&quot;TQ5uGkqQxVq4wJm8mR2s7cH9yK3pLx1aBz&quot;,&quot;binance_account_id&quot;:&quot;funding-main-01&quot;,&quot;environment&quot;:&quot;prod&quot;,&quot;memo&quot;:&quot;&quot;,&quot;network&quot;:&quot;TRX&quot;,&quot;operation&quot;:&quot;WITHDRAW&quot;,&quot;schema&quot;:&quot;binance-exec/instruction/v1&quot;,&quot;service_id&quot;:&quot;binance-exec&quot;,&quot;source_account&quot;:&quot;binance-main&quot;,&quot;tms_payment_uuid&quot;:&quot;7d1f2c9e-4b3a-4c1e-9f55-2a6b8e0d1c42&quot;,&quot;version&quot;:1,&quot;wallet_type&quot;:1}
+</code></pre>
+<p><code>instruction_hash</code> = <code>7a697f34fc44c53ca2e3c9a61daa56147e85b211721c3ff0cc6d26e2276ee26c</code></p>
+<p>Approval request:</p>
+<pre><code class="language-json">{&quot;approval_expires_at&quot;:&quot;2026-10-30T03:20:00Z&quot;,&quot;approval_nonce&quot;:&quot;q3Vh2m0x0yZQ8rJ3pYb5sN1c7dE4fG6hK9iL2mN4oP8&quot;,&quot;environment&quot;:&quot;prod&quot;,&quot;instruction_hash&quot;:&quot;7a697f34fc44c53ca2e3c9a61daa56147e85b211721c3ff0cc6d26e2276ee26c&quot;,&quot;operator_id&quot;:&quot;op-0007&quot;,&quot;rp_id&quot;:&quot;approve.example.com&quot;,&quot;schema&quot;:&quot;binance-exec/approval-request/v1&quot;,&quot;service_id&quot;:&quot;binance-exec&quot;}
+</code></pre>
+<p><code>challenge</code> = <code>052a7a1285c0b42538c1b6136f2980c9c9d94886bed953b6cb99f7b5a1d950e8</code> (base64url <code>BSp6EoXAtCU4wbYTbymAycnZSIa-2VO2y5n3taHZUOg</code>)</p>
+<p>The same instruction with <code>"amount":"1250.50"</code> must be rejected at validation; if a bug let it through, its hash (<code>efc00e9e…</code>) would differ, so existing approvals would not match. Ship these vectors as fixtures in the canonicalizer tests (T-CAN-01..07).</p>
+<h2 id="internal-api">Internal API</h2>
+<p>TMS can create, read and cancel instructions over mTLS on the PSC endpoint, and nothing else; there is no way to send approval state.</p>
+<p><strong>Transport:</strong> HTTPS on <code>10.10.2.50:8443</code> (PSC). TLS 1.3 only. Client certificate required, issued by the private CA in <code>prj-exec</code>, subject <code>CN=tms-prod</code>; the service checks the certificate's SPIFFE-style URI SAN <code>spiffe://&lt;domain&gt;/tms</code> against an allowlist. Requests without a valid certificate are dropped at the TLS layer. Bodies are JSON, max 16 KiB, <code>Content-Type: application/json</code> required.</p>
+<h3 id="post-v1instructions"><code>POST /v1/instructions</code></h3>
+<p>Request:</p>
+<pre><code class="language-json">{
+  &quot;tms_payment_uuid&quot;: &quot;7d1f2c9e-4b3a-4c1e-9f55-2a6b8e0d1c42&quot;,
+  &quot;version&quot;: 1,
+  &quot;operation&quot;: &quot;WITHDRAW&quot;,
+  &quot;source_account&quot;: &quot;binance-main&quot;,
+  &quot;asset&quot;: &quot;USDT&quot;,
+  &quot;amount&quot;: &quot;1250.5&quot;,
+  &quot;beneficiary_address&quot;: &quot;TQ5uGkqQxVq4wJm8mR2s7cH9yK3pLx1aBz&quot;,
+  &quot;network&quot;: &quot;TRX&quot;,
+  &quot;memo&quot;: &quot;&quot;
+}
+</code></pre>
+<p>Behaviour:</p>
+<ol>
+<li>Validate against the schema (unknown fields → <code>400 unknown_field</code>; this is how <code>approved: true</code> is rejected).</li>
+<li>Resolve <code>binance_account_id</code> and <code>wallet_type</code> from policy, build the canonical bytes, evaluate create-time policy; on denial → <code>422 policy_denied</code> with the rule ID.</li>
+<li>In one transaction holding the per-payment lock (<code>SELECT … FROM payments WHERE tms_payment_uuid = $1 FOR UPDATE</code>, creating the row if missing):
+   - If <code>(tms_payment_uuid, version)</code> exists with identical canonical bytes → <code>200</code> with the existing record (idempotent retry). Different bytes → <code>409 version_conflict</code>.
+   - If any version of this UUID has an active execution attempt (<code>RESERVED</code>, <code>SENDING</code>, <code>ACCEPTED</code>, <code>UNKNOWN</code>, <code>MANUAL_REVIEW</code>) or is <code>CONFIRMED</code> → <code>409 already_executing</code>.
+   - Otherwise mark every lower version in <code>PENDING_APPROVAL</code> or <code>APPROVED</code> as <code>SUPERSEDED</code> (their approvals no longer count), insert the new version, audit <code>instruction.created</code> and <code>instruction.superseded</code>, return <code>201</code>.</li>
+<li>The same per-payment lock is taken by cancel and by the executor's reserve step, so a stale version can never be reserved while a newer one is being created.</li>
+</ol>
+<p>Response <code>201</code>:</p>
+<pre><code class="language-json">{
+  &quot;instruction_id&quot;: &quot;ins_01JBX9W3K7Q2Y8T6M4N5P0R1S2&quot;,
+  &quot;tms_payment_uuid&quot;: &quot;7d1f2c9e-4b3a-4c1e-9f55-2a6b8e0d1c42&quot;,
+  &quot;version&quot;: 1,
+  &quot;instruction_hash&quot;: &quot;39af9f50c66f6c3adb8ee26a6c3cffe53f9112fa51caec1450a45b5a8bd716d7&quot;,
+  &quot;state&quot;: &quot;PENDING_APPROVAL&quot;,
+  &quot;required_approvals&quot;: 2,
+  &quot;approval_url&quot;: &quot;https://approve.example.com/i/ins_01JBX9W3K7Q2Y8T6M4N5P0R1S2&quot;,
+  &quot;expires_at&quot;: &quot;2026-10-31T03:15:00Z&quot;
+}
+</code></pre>
+<h3 id="get-v1instructionsinstruction_id-and-get-v1paymentstms_payment_uuid"><code>GET /v1/instructions/{instruction_id}</code> and <code>GET /v1/payments/{tms_payment_uuid}</code></h3>
+<p>Returns the record above plus <code>approvals_received</code>, <code>execution</code> (<code>state</code>, <code>binance_withdraw_id</code>, <code>tx_id</code> when available, <code>updated_at</code>) and <code>failure_reason</code> for terminal failures. Never returns operator identities' personal data beyond operator IDs.</p>
+<h3 id="post-v1instructionsinstruction_idcancel"><code>POST /v1/instructions/{instruction_id}/cancel</code></h3>
+<p>Allowed only in <code>PENDING_APPROVAL</code> or <code>APPROVED</code> (before reservation) → <code>CANCELLED</code>. Otherwise <code>409 not_cancellable</code>.</p>
+<h3 id="errors">Errors</h3>
+<table>
+<thead>
+<tr>
+<th>HTTP</th>
+<th><code>error.code</code></th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>400</td>
+<td><code>invalid_json</code>, <code>unknown_field</code>, <code>missing_field</code>, <code>invalid_amount</code>, <code>invalid_field</code></td>
+<td>Schema validation</td>
+</tr>
+<tr>
+<td>401</td>
+<td>—</td>
+<td>Never returned; bad mTLS is a TLS failure</td>
+</tr>
+<tr>
+<td>403</td>
+<td><code>client_not_allowed</code></td>
+<td>Certificate valid but not in allowlist</td>
+</tr>
+<tr>
+<td>404</td>
+<td><code>not_found</code></td>
+<td>Unknown ID</td>
+</tr>
+<tr>
+<td>409</td>
+<td><code>version_conflict</code>, <code>already_executing</code>, <code>not_cancellable</code></td>
+<td>State conflicts</td>
+</tr>
+<tr>
+<td>413</td>
+<td><code>body_too_large</code></td>
+<td>&gt; 16 KiB</td>
+</tr>
+<tr>
+<td>422</td>
+<td><code>policy_denied</code> (+ <code>rule_id</code>)</td>
+<td>Policy create-time rules</td>
+</tr>
+<tr>
+<td>429</td>
+<td><code>rate_limited</code></td>
+<td>&gt; 20 creates/s from TMS</td>
+</tr>
+<tr>
+<td>503</td>
+<td><code>unavailable</code></td>
+<td>Database down or service draining; safe to retry with the same body</td>
+</tr>
+</tbody>
+</table>
+<p>Error body: <code>{"error":{"code":"policy_denied","rule_id":"limit.per_tx.USDT","request_id":"…"}}</code>. No stack traces, no policy values.</p>
+<h3 id="explicitly-not-provided">Explicitly not provided</h3>
+<p>No endpoint to approve, to mark approved, to execute, to change an instruction, to call Binance, to list Binance balances, or to pass a URL. The router has a fixed route table; any other path returns <code>404</code> and is counted in <code>exec_api_unknown_route_total</code>.</p>
+<h3 id="approval-origin-and-admin-routes-browser-not-tms">Approval origin and admin routes (browser, not TMS)</h3>
+<table>
+<thead>
+<tr>
+<th>Host and route</th>
+<th>Process</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>approve.&lt;domain&gt;</code> <code>GET /i/{id}</code></td>
+<td><code>exec-web</code></td>
+<td>Approval page (server-rendered)</td>
+</tr>
+<tr>
+<td><code>approve.&lt;domain&gt;</code> <code>POST /i/{id}/challenge</code></td>
+<td><code>exec-web</code></td>
+<td>Create approval request + WebAuthn options for the signed-in operator; <code>?intent=approve</code> or <code>?intent=reject</code></td>
+</tr>
+<tr>
+<td><code>approve.&lt;domain&gt;</code> <code>POST /i/{id}/assert</code></td>
+<td><code>exec-web</code></td>
+<td>Submit the WebAuthn assertion for an approval</td>
+</tr>
+<tr>
+<td><code>approve.&lt;domain&gt;</code> <code>POST /i/{id}/reject</code></td>
+<td><code>exec-web</code></td>
+<td>Submit a WebAuthn assertion over a rejection request (same ceremony, <code>intent: reject</code> inside the signed request) plus a reason; CSRF token required</td>
+</tr>
+<tr>
+<td><code>approve.&lt;domain&gt;</code> <code>GET /enrol/{code}</code>, <code>POST /enrol/{code}/options</code>, <code>POST /enrol/{code}/finish</code></td>
+<td><code>exec-web</code></td>
+<td>Passkey registration with a one-time code</td>
+</tr>
+<tr>
+<td><code>exec-admin.&lt;domain&gt;</code> <code>/*</code></td>
+<td><code>exec-admin</code></td>
+<td>Admin UI; separate hostname, LB backend and IAP policy. The approval host has no <code>/admin</code> path</td>
+</tr>
+</tbody>
+</table>
+<h2 id="webauthn">WebAuthn</h2>
+<p>The service is the WebAuthn relying party for <code>approve.&lt;domain&gt;</code>: it issues every challenge, verifies every assertion with a maintained library plus its own binding checks, and trusts nothing the browser or TMS says about approval.</p>
+<p><strong>Library:</strong> use one maintained server library and pin it: <code>py_webauthn</code> (Python), <code>@simplewebauthn/server</code> (Node.js), <code>webauthn4j</code> (Java) or <code>go-webauthn</code> (Go). Do not hand-roll CBOR/COSE parsing. The checks below are what the library does plus what the service must add.</p>
+<p><strong>Operator identity before WebAuthn:</strong> IAP authenticates the Google account and passes a signed <code>x-goog-iap-jwt-assertion</code> header. The service verifies that JWT (audience = the backend service, issuer <code>https://cloud.google.com/iap</code>) and maps the email to an active operator. The challenge is created for that operator only.</p>
+<h3 id="registration-options-enrolment">Registration options (enrolment)</h3>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rp</code></td>
+<td><code>{ id: "approve.&lt;domain&gt;", name: "Binance approvals" }</code></td>
+</tr>
+<tr>
+<td><code>user.id</code></td>
+<td>16 random bytes per operator, stored; never the email</td>
+</tr>
+<tr>
+<td><code>pubKeyCredParams</code></td>
+<td>ES256 (−7), EdDSA (−8), RS256 (−257)</td>
+</tr>
+<tr>
+<td><code>authenticatorSelection</code></td>
+<td><code>residentKey: "required"</code>, <code>userVerification: "required"</code></td>
+</tr>
+<tr>
+<td><code>attestation</code></td>
+<td><code>"direct"</code> if you require device-bound security keys (verify AAGUID against an allowlist via FIDO MDS); <code>"none"</code> if synced Passkeys are allowed</td>
+</tr>
+<tr>
+<td><code>excludeCredentials</code></td>
+<td>Operator's existing credentials</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>300 000 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Store per credential: <code>credential_id</code>, COSE public key, <code>sign_count</code>, AAGUID, backup-eligible and backup-state flags, transports, created time, enrolment event ID.</p>
+<h3 id="authentication-options-approval">Authentication options (approval)</h3>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>challenge</code></td>
+<td>32-byte SHA-256 of the canonical approval request</td>
+</tr>
+<tr>
+<td><code>rpId</code></td>
+<td><code>approve.&lt;domain&gt;</code></td>
+</tr>
+<tr>
+<td><code>allowCredentials</code></td>
+<td>Only this operator's active credential IDs</td>
+</tr>
+<tr>
+<td><code>userVerification</code></td>
+<td><code>"required"</code></td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>300 000 ms (equal to approval expiry)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="verification-algorithm-post-iidassert">Verification algorithm (<code>POST /i/{id}/assert</code>)</h3>
+<p>Step 2 commits on its own, so a failed or tampered attempt still burns the challenge; steps 3–9 run in a second transaction. Any failure → <code>approval.rejected</code> audit event naming the failed step, HTTP 400 with a generic message.</p>
+<ol>
+<li>Load the challenge row by the challenge bytes from <code>clientDataJSON</code>; it must belong to this instruction, this IAP-authenticated operator and the route's intent (<code>approve</code> or <code>reject</code>, which is a field of the signed approval request).</li>
+<li>Consume it: <code>UPDATE challenges SET used_at = now() WHERE id = $1 AND used_at IS NULL AND expires_at &gt; now()</code> must affect exactly one row (expiry and replay). Commit.</li>
+<li>Recompute the approval request from stored fields and check <code>SHA-256(canonical) == challenge</code> (binding).</li>
+<li>Library verification with expected challenge, <code>expectedOrigin = "https://approve.&lt;domain&gt;"</code>, <code>expectedRPID = "approve.&lt;domain&gt;"</code>, <code>requireUserVerification = true</code>:
+   - <code>clientDataJSON.type == "webauthn.get"</code>; no <code>crossOrigin: true</code>; <code>topOrigin</code> absent.
+   - <code>rpIdHash == SHA-256("approve.&lt;domain&gt;")</code>; flags UP = 1 and UV = 1.
+   - Signature over <code>authenticatorData || SHA-256(clientDataJSON)</code> verifies with the stored public key for <code>credential_id</code>.</li>
+<li>Sign counter: if stored or received counter is non-zero, received must be greater than stored, otherwise reject and raise <code>security.clone_suspected</code>. Update stored counter.</li>
+<li>Credential is active (<code>revoked_at IS NULL</code> and <code>active_from &lt;= now()</code>) and belongs to the operator; if policy requires device-bound keys, the backup-eligible flag must be 0.</li>
+<li>Operator is active (<code>revoked_at IS NULL</code>, <code>active_from &lt;= now()</code>) and their role's <code>max_amount</code> for the asset covers <code>amount</code> (see Policy for the dual-approval rule).</li>
+<li>Lock the instruction: <code>SELECT … FROM instructions WHERE id = $1 FOR UPDATE</code>. It must still be <code>PENDING_APPROVAL</code>, with the same version and <code>instruction_hash</code> as the approval request, and be the highest version for its payment UUID.</li>
+<li>Insert the approval or rejection (primary key on instruction + operator, so the same operator cannot count twice), audit it, then — still holding the row lock — count valid approvals (step "Quorum" in Policy) and move to <code>APPROVED</code> if met, or count rejections and move to <code>CANCELLED</code> if <code>rejections_to_cancel</code> is reached. Commit.</li>
+</ol>
+<p>Because step 8 locks the instruction row, two approvers finishing at the same moment are serialized and the second one sees the first approval, so quorum is never missed.</p>
+<h3 id="browser-side">Browser side</h3>
+<p>The approval page calls <code>navigator.credentials.get({ publicKey })</code> with the options above, base64url-encodes the response fields, and posts them. It never computes or alters the challenge. Use the same library's browser helper (<code>@simplewebauthn/browser</code> or equivalent), self-hosted.</p>
+<h2 id="approval-screen">Approval screen</h2>
+<p>The Passkey prompt shows no transaction details, so this page is what ops actually approve: it must show every execution-relevant field from the stored canonical instruction, and nothing outside the execution service may be able to change it.</p>
+<h3 id="content-top-to-bottom">Content (top to bottom)</h3>
+<ol>
+<li>Environment banner: <code>PRODUCTION</code> in red, or <code>STAGING</code> in amber; taken from service config.</li>
+<li>Operation and source account (logical name plus the Binance account label from policy).</li>
+<li><strong>Amount</strong> in large type with the asset, exactly the canonical string, plus a thousands-separated rendering (<code>1,250.5 USDT</code>) labelled "same value".</li>
+<li><strong>Destination:</strong> network name and code, full address in monospace split into groups of 4 characters, memo (or "none"), and the allowlist entry name from policy ("Treasury cold wallet"). An address not in the allowlist never reaches this page.</li>
+<li>TMS payment UUID, version, created time, instruction hash (first 8 + last 8 hex characters, full on click).</li>
+<li>Approval status: required count, who has already approved (operator display names), time left on the instruction.</li>
+<li>Policy summary: per-transaction limit, today's usage for this account and asset after this payment.</li>
+<li>Buttons: <strong>Approve with Passkey</strong> and <strong>Reject</strong> with Passkey (a signed rejection with a reason; it does not block other approvers; rejections_to_cancel signed rejections cancel the instruction).</li>
+</ol>
+<p>All values are rendered server-side from <code>instructions.canonical_json</code> and policy; the page never takes values from query strings, TMS or local storage.</p>
+<h3 id="integrity-controls">Integrity controls</h3>
+<table>
+<thead>
+<tr>
+<th>Control</th>
+<th>Setting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Origin</td>
+<td><code>https://approve.&lt;domain&gt;</code> only; served by <code>exec-web</code> behind its own LB in <code>prj-exec</code>. The DNS zone for <code>approve.&lt;domain&gt;</code> is delegated to Cloud DNS in <code>prj-exec</code> (you are the only DNS admin), CAA records allow only Google Trust Services, and Certificate Transparency logs are monitored for any other certificate for that name</td>
+</tr>
+<tr>
+<td>Content Security Policy</td>
+<td><code>default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'</code></td>
+</tr>
+<tr>
+<td>Third-party code</td>
+<td>None: no CDN, analytics, fonts or tag managers; all assets built into the image with Subresource Integrity hashes</td>
+</tr>
+<tr>
+<td>Framing</td>
+<td><code>frame-ancestors 'none'</code> and <code>X-Frame-Options: DENY</code></td>
+</tr>
+<tr>
+<td>Transport</td>
+<td>HSTS <code>max-age=31536000; includeSubDomains; preload</code>; TLS 1.2+</td>
+</tr>
+<tr>
+<td>Session</td>
+<td>IAP session plus a service session cookie: <code>__Host-</code> prefix, <code>Secure</code>, <code>HttpOnly</code>, <code>SameSite=Strict</code>, 15-minute idle timeout</td>
+</tr>
+<tr>
+<td>CSRF</td>
+<td><code>SameSite=Strict</code> plus a per-session token on <code>POST</code> routes</td>
+</tr>
+<tr>
+<td>Caching</td>
+<td><code>Cache-Control: no-store</code> on instruction pages</td>
+</tr>
+<tr>
+<td>Other headers</td>
+<td><code>Referrer-Policy: no-referrer</code>, <code>X-Content-Type-Options: nosniff</code>, <code>Permissions-Policy</code> denying everything except <code>publickey-credentials-get</code> for self</td>
+</tr>
+<tr>
+<td>Change control</td>
+<td>UI code lives in the execution repo; deploys follow the same approved pipeline as the service</td>
+</tr>
+</tbody>
+</table>
+<h3 id="accessibility-and-safety">Accessibility and safety</h3>
+<ul>
+<li>Approve is never the default button and is disabled for 3 seconds after the page loads, so a stray Enter or double click does nothing.</li>
+<li>Amounts above the dual-approval threshold show a confirmation step that repeats amount and destination name.</li>
+<li>The page works without client-side templating; the only script is the WebAuthn call.</li>
+</ul>
+<h2 id="policy">Policy</h2>
+<p>Policy is one YAML file, versioned in Git, reviewed by you, shipped with the image, loaded read-only at start, and evaluated at three points: create, quorum and reserve.</p>
+<h3 id="example-policyprodyaml">Example <code>policy/prod.yaml</code></h3>
+<pre><code class="language-yaml">policy_version: &quot;2026-10-30.1&quot;          # recorded on every decision
+environment: prod
+operations: [WITHDRAW]
+source_accounts:
+  binance-main:
+    binance_account_id: &quot;funding-main-01&quot; # copied into the instruction (approved)
+    wallet_type: 1                       # 1 = funding wallet; copied into the instruction
+    secret_ref: binance-main             # Secret Manager secret prefix
+    assets: [USDT, BTC]
+assets:
+  USDT:
+    precision: 6
+    networks:
+      TRX: { address_regex: &quot;^T[1-9A-HJ-NP-Za-km-z]{33}$&quot;, memo_required: false }
+      ETH: { address_regex: &quot;^0x[0-9a-fA-F]{40}$&quot;,        memo_required: false }
+    per_tx_max: &quot;50000&quot;
+    daily_max_per_account: &quot;200000&quot;
+    dual_approval_above: &quot;10000&quot;         # strictly greater than
+  BTC:
+    precision: 8
+    networks:
+      BTC: { address_regex: &quot;^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$&quot;, memo_required: false }
+    per_tx_max: &quot;2&quot;
+    daily_max_per_account: &quot;5&quot;
+    dual_approval_above: &quot;0.5&quot;
+destinations:                            # mirrored in Binance's withdrawal whitelist
+  - name: &quot;Treasury cold wallet&quot;
+    asset: USDT
+    network: TRX
+    address: &quot;TQ5uGkqQxVq4wJm8mR2s7cH9yK3pLx1aBz&quot;
+    memo: &quot;&quot;
+roles:                                   # each approver must individually cover the amount
+  approver:        { max_amount: { USDT: &quot;10000&quot;,  BTC: &quot;0.5&quot; } }
+  senior_approver: { max_amount: { USDT: &quot;50000&quot;,  BTC: &quot;2&quot; } }
+approvals:
+  challenge_ttl_seconds: 300
+  instruction_ttl_hours: 24
+  rejections_to_cancel: 2
+  new_approver_delay_hours: 24           # also applies to new credentials and role upgrades
+</code></pre>
+<h3 id="evaluation">Evaluation</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Rules (in order); first failure wins</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Create</td>
+<td>environment; operation; source account; asset for account; network for asset; amount precision; <code>amount ≤ per_tx_max</code>; address regex; memo rule; destination in allowlist (exact match of asset + network + address + memo)</td>
+<td><code>422 policy_denied</code> + <code>rule_id</code></td>
+</tr>
+<tr>
+<td>Approval</td>
+<td>operator and credential active; operator's role <code>max_amount</code> for the asset ≥ <code>amount</code>; not already approved or rejected this version</td>
+<td>Approval rejected</td>
+</tr>
+<tr>
+<td>Quorum</td>
+<td>distinct, currently active operators with non-voided approvals for this exact version and hash ≥ required, where required = 1, or 2 when <code>amount &gt; dual_approval_above</code>, and required = <code>max(stored at create, current policy)</code></td>
+<td><code>APPROVED</code> when met</td>
+</tr>
+<tr>
+<td>Reserve</td>
+<td>quorum re-computed from the <code>approvals</code> table (never from the state column); everything from Create again with the <strong>current</strong> policy; <code>binance_account_id</code> and <code>wallet_type</code> unchanged; instruction not expired and is the highest version for its payment; daily sum for this account + asset of executions reserved in the last 24 h in <code>RESERVED</code>, <code>SENDING</code>, <code>ACCEPTED</code>, <code>UNKNOWN</code>, <code>MANUAL_REVIEW</code>, <code>CONFIRMED</code>, plus this amount, ≤ <code>daily_max_per_account</code></td>
+<td><code>RESERVED</code>, or <code>BLOCKED_BY_POLICY</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>What the roles mean in practice:</strong> with the example policy, a 5,000 USDT payment needs one approver or senior approver; a 25,000 USDT payment needs two <strong>senior</strong> approvers, because each approver must individually cover the amount. If you want a junior approver to co-approve large payments, raise their <code>max_amount</code>; there is no mixed rule.</p>
+<p><strong>Daily-limit race:</strong> the reserve transaction takes <code>pg_advisory_xact_lock(hashtext(source_account || ':' || asset))</code> before computing the daily sum, so two executors reserving different payments on the same account and asset cannot both pass the limit.</p>
+<p>A policy change never weakens checks on instructions already approved: reserve re-evaluates with the new policy, so a lowered limit blocks pending payments; a raised threshold does not reduce required approvals for instructions created under the old one.</p>
+<h3 id="policy-loading">Policy loading</h3>
+<ul>
+<li>File path baked into the image; the service refuses to start if the file is missing, fails schema validation, or <code>environment</code> differs from the runtime config.</li>
+<li><code>policy_version</code> and the file's SHA-256 go into the <code>service.started</code> audit event and every decision event.</li>
+<li>No runtime API changes policy. A change is a pull request to <code>policy/</code> with you as required reviewer, then a normal deploy.</li>
+</ul>
+<h2 id="execution-state-machine">Execution state machine</h2>
+<p>Every instruction version moves through one state machine stored in Postgres; a payment has at most one live execution attempt at a time and never another after a confirmed one, and nothing leaves <code>SENDING</code> or <code>UNKNOWN</code> without evidence from Binance or an audited two-admin decision.</p>
+<figure><a href="diagram-states.html"><img src="states.png" alt="Execution state machine"></a><figcaption>Click the diagram to open the full-size version.</figcaption></figure>
+<p>The diagram shows the main path; the table below is authoritative and includes the rarer transitions.</p>
+<h3 id="transitions">Transitions</h3>
+<table>
+<thead>
+<tr>
+<th>From</th>
+<th>To</th>
+<th>Trigger</th>
+<th>Guard</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>—</td>
+<td><code>PENDING_APPROVAL</code></td>
+<td><code>POST /v1/instructions</code></td>
+<td>Schema and create-time policy pass</td>
+</tr>
+<tr>
+<td><code>PENDING_APPROVAL</code></td>
+<td><code>APPROVED</code></td>
+<td>Accepted approval completes quorum (instruction row locked)</td>
+<td>Distinct active operators; same version and hash</td>
+</tr>
+<tr>
+<td><code>APPROVED</code></td>
+<td><code>PENDING_APPROVAL</code></td>
+<td>An approval is voided (approver or credential revoked) and quorum is no longer met</td>
+<td>Not yet reserved</td>
+</tr>
+<tr>
+<td><code>PENDING_APPROVAL</code>, <code>APPROVED</code></td>
+<td><code>SUPERSEDED</code></td>
+<td>Higher version created</td>
+<td>Per-payment lock held</td>
+</tr>
+<tr>
+<td><code>PENDING_APPROVAL</code>, <code>APPROVED</code></td>
+<td><code>CANCELLED</code></td>
+<td>TMS cancel, or signed rejections reach <code>rejections_to_cancel</code></td>
+<td>Not yet reserved</td>
+</tr>
+<tr>
+<td><code>PENDING_APPROVAL</code>, <code>APPROVED</code></td>
+<td><code>EXPIRED</code></td>
+<td>Instruction TTL (24 h) passes</td>
+<td>Not yet reserved</td>
+</tr>
+<tr>
+<td><code>APPROVED</code></td>
+<td><code>RESERVED</code></td>
+<td>Executor reserve transaction</td>
+<td>Quorum re-computed from <code>approvals</code>; highest version; not expired; reserve-time policy passes; no active attempt for the payment</td>
+</tr>
+<tr>
+<td><code>APPROVED</code></td>
+<td><code>BLOCKED_BY_POLICY</code></td>
+<td>Reserve-time policy fails (limit, changed account mapping)</td>
+<td>Terminal; TMS may submit a new version</td>
+</tr>
+<tr>
+<td><code>RESERVED</code></td>
+<td><code>APPROVED</code></td>
+<td>Executor lease expired before <code>SENDING</code> was committed (no request was sent); attempt marked <code>RELEASED</code></td>
+<td>Lease expired</td>
+</tr>
+<tr>
+<td><code>RESERVED</code></td>
+<td><code>MANUAL_REVIEW</code></td>
+<td><code>SHA-256(canonical_json) ≠ instruction_hash</code></td>
+<td>Critical alert</td>
+</tr>
+<tr>
+<td><code>RESERVED</code></td>
+<td><code>SENDING</code></td>
+<td>Executor commits this row <strong>before</strong> the HTTP call</td>
+<td>Lease held</td>
+</tr>
+<tr>
+<td><code>SENDING</code></td>
+<td><code>ACCEPTED</code></td>
+<td>Binance returns a withdrawal <code>id</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>SENDING</code></td>
+<td><code>FAILED</code></td>
+<td>Binance returns a definitive rejection (see Binance integration)</td>
+<td>Code in the definitive list</td>
+</tr>
+<tr>
+<td><code>SENDING</code></td>
+<td><code>UNKNOWN</code></td>
+<td>Timeout, connection error, HTTP 5xx, <code>-1000</code>, unclassified error, or lease expired while sending</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>UNKNOWN</code></td>
+<td><code>ACCEPTED</code></td>
+<td>Reconciliation finds the attempt's <code>withdrawOrderId</code> with matching fields</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>UNKNOWN</code></td>
+<td><code>MANUAL_REVIEW</code></td>
+<td>Not found after 15 minutes of checks</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>ACCEPTED</code></td>
+<td><code>CONFIRMED</code></td>
+<td>Binance status <code>6</code> (Completed)</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>ACCEPTED</code></td>
+<td><code>FAILED</code></td>
+<td>Binance status <code>1</code>, <code>3</code> or <code>5</code> (Cancelled, Rejected, Failure)</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>ACCEPTED</code>, <code>UNKNOWN</code></td>
+<td><code>MANUAL_REVIEW</code></td>
+<td>History record found but a field (coin, network, address, tag, amount) differs</td>
+<td>Critical alert</td>
+</tr>
+<tr>
+<td><code>MANUAL_REVIEW</code></td>
+<td><code>CONFIRMED</code></td>
+<td>Admin decision with Binance evidence</td>
+<td>One admin</td>
+</tr>
+<tr>
+<td><code>MANUAL_REVIEW</code></td>
+<td><code>FAILED</code></td>
+<td>Admin decision with evidence that Binance has no record</td>
+<td><strong>Two admins</strong> (proposer and confirmer must differ)</td>
+</tr>
+</tbody>
+</table>
+<p>Terminal: <code>CONFIRMED</code>, <code>FAILED</code>, <code>CANCELLED</code>, <code>EXPIRED</code>, <code>SUPERSEDED</code>, <code>BLOCKED_BY_POLICY</code>. The <code>exec_admin</code> database role can only perform the two <code>MANUAL_REVIEW</code> transitions; a trigger rejects any other state change by that role (see Database schema).</p>
+<h3 id="attempts-and-retries">Attempts and retries</h3>
+<ul>
+<li>Executions are keyed by <code>(tms_payment_uuid, attempt)</code>. Each attempt has its own <code>withdrawOrderId</code> = payment UUID without dashes + <code>a</code> + attempt number (e.g. <code>7d1f2c9e4b3a4c1e9f552a6b8e0d1c42a1</code>, 34 characters).</li>
+<li>A partial unique index allows at most one non-final attempt per payment (<code>RESERVED</code>, <code>SENDING</code>, <code>ACCEPTED</code>, <code>UNKNOWN</code>, <code>MANUAL_REVIEW</code>), and no new attempt once any attempt is <code>CONFIRMED</code>.</li>
+<li>A new attempt is possible only for a new instruction version with fresh approvals, and only when every previous attempt is <code>FAILED</code> or <code>RELEASED</code>.</li>
+<li>After a two-admin <code>FAILED</code> decision, reconciliation keeps querying that attempt's <code>withdrawOrderId</code> until 7 days after the attempt started. If Binance ever shows it, the attempt becomes <code>CONFIRMED</code>, a critical alert fires (<code>security.late_found</code>), and any later attempt for the same payment is flagged for treasury review as a possible double payment.</li>
+</ul>
+<h3 id="reserve-and-send-executor-loop">Reserve and send (executor loop)</h3>
+<pre><code class="language-sql">-- tx 1: reserve
+BEGIN;
+SELECT 1 FROM payments WHERE tms_payment_uuid = $uuid FOR UPDATE;                  -- per-payment lock
+SELECT pg_advisory_xact_lock(hashtext($source_account || ':' || $asset));         -- daily-limit lock
+SELECT * FROM instructions
+ WHERE id = $id AND state = 'APPROVED' AND expires_at &gt; now()
+   AND version = (SELECT max(version) FROM instructions WHERE tms_payment_uuid = $uuid)
+ FOR UPDATE;                                                                       -- 0 rows =&gt; skip
+-- quorum from source of truth, never from the state column:
+SELECT count(DISTINCT a.operator_id)
+  FROM approvals a
+  JOIN challenges c  ON c.id = a.challenge_id AND c.used_at IS NOT NULL
+  JOIN operators o   ON o.id = a.operator_id AND o.revoked_at IS NULL AND o.active_from &lt;= now()
+  JOIN credentials k ON k.credential_id = a.credential_id AND k.revoked_at IS NULL AND k.active_from &lt;= now()
+ WHERE a.instruction_id = $id AND a.voided_at IS NULL AND a.intent = 'approve'
+   AND a.instruction_hash = $instruction_hash;                                      -- must be &gt;= required
+-- application: re-run reserve-time policy incl. daily sum (by executions.reserved_at) and account mapping
+INSERT INTO executions (tms_payment_uuid, attempt, instruction_id, state, withdraw_order_id,
+                        reserved_at, lease_owner, lease_until)
+     VALUES ($uuid, $next_attempt, $id, 'RESERVED', $order_id, now(), $worker_id, now() + interval '60 seconds');
+UPDATE instructions SET state = 'RESERVED' WHERE id = $id;
+-- audit outbox rows for policy.decision and execution.reserved
+COMMIT;
+
+-- tx 2: mark sending, durably, before any network call (lease must still be ours)
+UPDATE executions SET state = 'SENDING', attempt_started_at = now(), lease_until = now() + interval '60 seconds'
+ WHERE tms_payment_uuid = $uuid AND attempt = $n AND state = 'RESERVED' AND lease_owner = $worker_id;  -- 1 row
+UPDATE instructions SET state = 'SENDING' WHERE id = $id;
+COMMIT;
+
+-- single Binance call (no automatic retry)
+
+-- tx 3: record outcome
+UPDATE executions SET state = 'ACCEPTED' | 'FAILED' | 'UNKNOWN', binance_withdraw_id = ..., last_error = ...,
+                      lease_owner = NULL, lease_until = NULL
+ WHERE tms_payment_uuid = $uuid AND attempt = $n AND state = 'SENDING' AND lease_owner = $worker_id;
+UPDATE instructions SET state = &lt;same&gt; WHERE id = $id;
+COMMIT;
+</code></pre>
+<p>Rules:</p>
+<ul>
+<li>The executor reads only <code>instructions.canonical_json</code>, recomputes its SHA-256 against <code>instruction_hash</code>, and builds the Binance request from those bytes. It never reads TMS data or any mutable column.</li>
+<li>The HTTP client never retries <code>POST</code> requests; library-level retries are switched off. The total call timeout (10 s) is well under the 60 s lease, and the worker renews its lease every 20 s while a call is open.</li>
+<li><strong>Lease recovery</strong> (any worker, every 30 s): rows whose <code>lease_until &lt; now()</code> are reclaimed — <code>RESERVED</code> → attempt <code>RELEASED</code>, instruction back to <code>APPROVED</code>; <code>SENDING</code> → <code>UNKNOWN</code>. A worker never touches rows whose lease is still valid, so a restarting VM cannot disturb another VM's in-flight call.</li>
+<li>Audit backpressure (too many unshipped events) blocks <code>RESERVED</code> → <code>SENDING</code>; such rows wait with a renewed lease or are released when the lease lapses.</li>
+</ul>
+<h2 id="binance-integration">Binance integration</h2>
+<p>The Binance client knows exactly the six endpoints in the table below, sends each withdrawal attempt once with its own <code>withdrawOrderId</code>, and treats anything other than a clear success or a clear rejection as unknown until withdrawal history says otherwise.</p>
+<h3 id="allowed-endpoints-hardcoded-allowlist">Allowed endpoints (hardcoded allowlist)</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Purpose</th>
+<th>Method and path</th>
+<th>Signed</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Submit withdrawal</td>
+<td><code>POST /sapi/v1/capital/withdraw/apply</code></td>
+<td>yes</td>
+<td>Params: <code>coin</code>, <code>network</code>, <code>address</code>, <code>addressTag</code> (only when memo non-empty), <code>amount</code>, <code>withdrawOrderId</code>, <code>walletType</code>, <code>timestamp</code>, <code>recvWindow=5000</code>, <code>signature</code>. Response <code>{"id": "…"}</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Reconcile / track</td>
+<td><code>GET /sapi/v1/capital/withdraw/history</code></td>
+<td>yes</td>
+<td>Query by <code>withdrawOrderId</code> (Binance limits that query to a 7-day window; default is the last 7 days) or by <code>idList</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Network rules</td>
+<td><code>GET /sapi/v1/capital/config/getall</code></td>
+<td>yes</td>
+<td>At start and hourly: network enabled, <code>withdrawTag</code> rule matches policy, min/max amounts</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Travel rule check</td>
+<td><code>GET /sapi/v1/localentity/questionnaire-requirements</code></td>
+<td>yes</td>
+<td>At start: anything other than <code>NIL</code> means the account must use <code>POST /sapi/v1/localentity/withdraw/apply</code> with travel-rule data; that is a separate, explicitly approved design change</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Key restrictions evidence</td>
+<td><code>GET /sapi/v1/account/apiRestrictions</code></td>
+<td>yes</td>
+<td>At start and daily; output written to the audit trail (SC-04, SC-05); refuse to send if withdrawals are not IP-restricted</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Server time</td>
+<td><code>GET /api/v3/time</code></td>
+<td>no</td>
+<td>Clock skew check</td>
+</tr>
+</tbody>
+</table>
+<p>This table is the single authoritative list; the client's allowlist, the Binance mock, SC-12 and epic E6 all refer to it.</p>
+<p>Base URL <code>https://api.binance.com</code> only, from config baked into the image; no caller can supply a URL, path or parameter name. Response bodies are size-limited (1 MiB) and parsed against strict schemas.</p>
+<p><strong>Mapping from the instruction:</strong> <code>coin = asset</code>, <code>network = network</code>, <code>address = beneficiary_address</code>, <code>amount = amount</code> (the canonical string, sent as-is), <code>walletType = wallet_type</code>, <code>addressTag = memo</code> only if non-empty (Binance returns <code>-4106</code> when a tag is sent on a network that does not support it), <code>withdrawOrderId</code> = the attempt's ID (payment UUID without dashes + <code>a</code> + attempt, 34 characters; confirm Binance's maximum length in the first integration test). The API key used is the one for <code>binance_account_id</code>.</p>
+<h3 id="request-signing">Request signing</h3>
+<ul>
+<li>Prefer an asymmetric API key (Ed25519, or RSA) if Binance accepts it for the withdrawal endpoints on your account: you generate the key pair, Binance stores only the public key, and the private key never leaves <code>prj-exec</code>. Otherwise use an HMAC key.</li>
+<li>Signature over the exact query string sent; header <code>X-MBX-APIKEY</code>.</li>
+<li>Clock: the VM syncs to Google's NTP; reject sending if local clock skew against Binance's <code>GET /api/v3/time</code> exceeds 1 s.</li>
+</ul>
+<h3 id="outcome-classification">Outcome classification</h3>
+<table>
+<thead>
+<tr>
+<th>Observation</th>
+<th>Classification</th>
+<th>State</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP 200 with <code>id</code></td>
+<td>Accepted</td>
+<td><code>ACCEPTED</code></td>
+</tr>
+<tr>
+<td>HTTP 4xx with a code from the definitive list below, before any <code>id</code></td>
+<td>Rejected, nothing created</td>
+<td><code>FAILED</code></td>
+</tr>
+<tr>
+<td>HTTP 5xx, or body code <code>-1000</code> ("unknown error" — Binance states the request may or may not have executed)</td>
+<td>Unknown</td>
+<td><code>UNKNOWN</code></td>
+</tr>
+<tr>
+<td>Timeout (connect 3 s, total 10 s), connection reset, TLS error after send</td>
+<td>Unknown</td>
+<td><code>UNKNOWN</code></td>
+</tr>
+<tr>
+<td>HTTP 429 / 418</td>
+<td>Not sent (rate limit) — but treat as <code>UNKNOWN</code> if the request body was fully sent</td>
+<td><code>UNKNOWN</code></td>
+</tr>
+<tr>
+<td>Any other code</td>
+<td>Unknown until reviewed and added to a list</td>
+<td><code>UNKNOWN</code></td>
+</tr>
+</tbody>
+</table>
+<p>The definitive-rejection list starts with validation errors for parameters, address, tag, minimum amount, insufficient balance, address-not-whitelisted and permission errors. Build it from Binance's error-code documentation during implementation; every code on it needs a test that shows Binance did not create a withdrawal.</p>
+<h3 id="reconciliation-algorithm">Reconciliation algorithm</h3>
+<p>Runs at startup and every 60 s for rows in <code>UNKNOWN</code> or <code>ACCEPTED</code>.</p>
+<pre><code class="language-text">for each attempt in (UNKNOWN, ACCEPTED) or (FAILED by manual decision, started &lt; 7 days ago):
+    records = GET withdraw/history?withdrawOrderId=&lt;attempt id&gt;        # last 7 days
+    if records has exactly 1 match:
+        compare coin, network, address, addressTag as strings and amount AS DECIMALS
+            (Binance pads amounts, e.g. &quot;1250.50000000&quot;; never compare amount strings)
+            mismatch -&gt; MANUAL_REVIEW + critical alert
+        store binance id, txId, status
+        if attempt was FAILED by manual decision -&gt; CONFIRMED + security.late_found (critical)
+        status 6        -&gt; CONFIRMED
+        status 1, 3, 5  -&gt; FAILED
+        status 0, 2, 4  -&gt; ACCEPTED (keep polling)
+    elif records has more than 1 match:
+        MANUAL_REVIEW + critical alert          # should be impossible
+    elif state == UNKNOWN and now - attempt_started_at &gt; 15 min:
+        MANUAL_REVIEW + page ops                # never auto-resend
+    else:
+        keep state, check again next cycle
+</code></pre>
+<ul>
+<li>An attempt older than 6 days still in <code>UNKNOWN</code> or <code>ACCEPTED</code> is escalated before it falls outside the 7-day query window.</li>
+<li>Reconciliation never creates a request; it only reads history.</li>
+<li>Confirm in the first integration test whether the history <code>amount</code> is the gross amount requested or net of the fee, and compare against the right value.</li>
+</ul>
+<h3 id="testing-against-binance">Testing against Binance</h3>
+<p>Binance's Spot test network does not serve <code>/sapi</code> endpoints, so withdrawals cannot be exercised there. Use a local Binance mock (WireMock or a small fake) that implements the six endpoints in the table above, can delay, drop the connection after receiving the body, return <code>-1000</code>, and later return the record from history. Then run a small real withdrawal in production with dual approval as the final acceptance step.</p>
+<h2 id="database-schema">Database schema</h2>
+<p>PostgreSQL 16 on Cloud SQL (private IP, HA, point-in-time recovery). Constraints and triggers in the database — not just the code — enforce single use, distinct approvers, one active attempt per payment, the state machine per role, and two-person admin actions.</p>
+<pre><code class="language-sql">CREATE TYPE instr_state AS ENUM ('PENDING_APPROVAL','APPROVED','RESERVED','SENDING','ACCEPTED','UNKNOWN',
+  'MANUAL_REVIEW','CONFIRMED','FAILED','CANCELLED','EXPIRED','SUPERSEDED','BLOCKED_BY_POLICY');
+CREATE TYPE attempt_state AS ENUM ('RESERVED','SENDING','ACCEPTED','UNKNOWN','MANUAL_REVIEW',
+  'CONFIRMED','FAILED','RELEASED');
+
+CREATE TABLE payments (                              -- one row per TMS payment; the per-payment lock
+  tms_payment_uuid uuid PRIMARY KEY,
+  created_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE operators (
+  id               text PRIMARY KEY,                 -- 'op-0007'
+  email            text NOT NULL UNIQUE,             -- IAP identity
+  display_name     text NOT NULL,
+  role             text NOT NULL CHECK (role IN ('approver','senior_approver')),
+  webauthn_user_id bytea NOT NULL UNIQUE,            -- 16 random bytes
+  active_from      timestamptz NOT NULL,             -- now() + 24h on creation and on role upgrade
+  revoked_at       timestamptz
+);
+
+CREATE TABLE enrolment_codes (
+  code_hash        bytea PRIMARY KEY,                -- SHA-256 of the one-time code
+  operator_id      text NOT NULL REFERENCES operators,
+  expires_at       timestamptz NOT NULL,
+  used_at          timestamptz,
+  admin_action_id  bigint NOT NULL                   -- the confirmed two-person action that issued it
+);
+
+CREATE TABLE credentials (
+  credential_id    bytea PRIMARY KEY,
+  operator_id      text NOT NULL REFERENCES operators,
+  public_key_cose  bytea NOT NULL,
+  sign_count       bigint NOT NULL DEFAULT 0,
+  aaguid           uuid,
+  backup_eligible  boolean NOT NULL,
+  backup_state     boolean NOT NULL,
+  transports       text[],
+  enrolment_code_hash bytea NOT NULL REFERENCES enrolment_codes,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  active_from      timestamptz NOT NULL,             -- now() + 24h: new Passkeys wait too
+  revoked_at       timestamptz
+);
+
+CREATE TABLE instructions (
+  id               text PRIMARY KEY,                 -- 'ins_' + ULID
+  tms_payment_uuid uuid NOT NULL REFERENCES payments,
+  version          int  NOT NULL CHECK (version &gt;= 1),
+  canonical_json   bytea NOT NULL,
+  instruction_hash bytea NOT NULL CHECK (length(instruction_hash) = 32),
+  amount           numeric(38,18) NOT NULL,          -- derived from canonical_json, for limit queries only
+  asset            text NOT NULL,
+  source_account   text NOT NULL,
+  tms_creator_id   text,                             -- advisory only
+  required_approvals smallint NOT NULL CHECK (required_approvals IN (1,2)),
+  policy_version   text NOT NULL,
+  state            instr_state NOT NULL,
+  expires_at       timestamptz NOT NULL,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tms_payment_uuid, version),
+  UNIQUE (instruction_hash)
+);
+CREATE INDEX ON instructions (state);
+
+CREATE TABLE challenges (
+  id               uuid PRIMARY KEY,
+  instruction_id   text NOT NULL REFERENCES instructions,
+  operator_id      text NOT NULL REFERENCES operators,
+  intent           text NOT NULL CHECK (intent IN ('approve','reject')),
+  approval_request bytea NOT NULL,                   -- canonical JSON, includes intent
+  challenge        bytea NOT NULL UNIQUE CHECK (length(challenge) = 32),
+  expires_at       timestamptz NOT NULL,
+  used_at          timestamptz
+);
+
+CREATE TABLE approvals (                             -- approvals and signed rejections
+  instruction_id   text NOT NULL REFERENCES instructions,
+  operator_id      text NOT NULL REFERENCES operators,
+  intent           text NOT NULL CHECK (intent IN ('approve','reject')),
+  instruction_hash bytea NOT NULL,
+  credential_id    bytea NOT NULL REFERENCES credentials,
+  challenge_id     uuid NOT NULL UNIQUE REFERENCES challenges,
+  reason           text,
+  verified_at      timestamptz NOT NULL DEFAULT now(),
+  voided_at        timestamptz,                      -- set when operator or credential is revoked
+  PRIMARY KEY (instruction_id, operator_id)          -- one decision per operator per version
+);
+
+CREATE TABLE executions (
+  tms_payment_uuid  uuid NOT NULL REFERENCES payments,
+  attempt           smallint NOT NULL CHECK (attempt &gt;= 1),
+  instruction_id    text NOT NULL REFERENCES instructions,
+  state             attempt_state NOT NULL,
+  withdraw_order_id text NOT NULL UNIQUE,
+  reserved_at       timestamptz NOT NULL,
+  attempt_started_at timestamptz,
+  lease_owner       text,
+  lease_until       timestamptz,
+  binance_withdraw_id text UNIQUE,
+  binance_status    smallint,
+  tx_id             text,
+  last_error        text,                            -- code + message, no request data
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tms_payment_uuid, attempt)
+);
+-- at most one live attempt per payment
+CREATE UNIQUE INDEX one_live_attempt ON executions (tms_payment_uuid)
+  WHERE state IN ('RESERVED','SENDING','ACCEPTED','UNKNOWN','MANUAL_REVIEW');
+-- never another attempt after a confirmed one
+CREATE UNIQUE INDEX one_confirmed ON executions (tms_payment_uuid) WHERE state = 'CONFIRMED';
+CREATE INDEX ON executions (reserved_at);
+
+CREATE TABLE admin_actions (                         -- two-person rule
+  id               bigserial PRIMARY KEY,
+  kind             text NOT NULL,                    -- add_operator, upgrade_role, issue_enrolment_code,
+                                                     -- revoke_credential, revoke_operator, manual_failed, ...
+  payload          jsonb NOT NULL,
+  proposed_by      text NOT NULL,                    -- IAP identity
+  proposed_at      timestamptz NOT NULL DEFAULT now(),
+  confirmed_by     text,
+  confirmed_at     timestamptz,
+  CHECK (confirmed_by IS NULL OR confirmed_by &lt;&gt; proposed_by)
+);
+
+CREATE TABLE audit_outbox (                          -- written in the same transaction as the change
+  id               bigserial PRIMARY KEY,            -- may have gaps; not the chain sequence
+  event            jsonb NOT NULL,
+  shipped_seq      bigint UNIQUE,                    -- gap-free sequence assigned by the shipper
+  shipped_at       timestamptz
+);
+</code></pre>
+<p>Revocations that are safe to apply immediately (<code>revoke_operator</code>, <code>revoke_credential</code>, role downgrade) take effect on proposal and are confirmed afterwards; additions and upgrades take effect only after confirmation plus the 24-hour delay.</p>
+<h3 id="database-roles-and-grants">Database roles and grants</h3>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Used by</th>
+<th>Grants</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exec_web</code></td>
+<td><code>exec-web</code> (IAM DB auth as <code>sa-exec-web</code>)</td>
+<td><code>SELECT</code> on <code>payments</code>, <code>operators</code>, <code>credentials</code>, <code>instructions</code>, <code>challenges</code>, <code>approvals</code>, <code>executions</code>; <code>INSERT</code> on <code>payments</code>, <code>instructions</code>, <code>challenges</code>, <code>approvals</code>, <code>audit_outbox</code>; <code>UPDATE</code> on <code>instructions(state)</code>, <code>challenges(used_at)</code>, <code>credentials(sign_count)</code>; <code>EXECUTE</code> on <code>finish_enrolment(code, …)</code> (security-definer function that checks the code and inserts the credential with <code>active_from = now() + 24h</code>). <strong>No insert on <code>operators</code>, <code>credentials</code> or <code>enrolment_codes</code>; no access to <code>admin_actions</code></strong></td>
+</tr>
+<tr>
+<td><code>exec_worker</code></td>
+<td><code>exec-worker</code> (as <code>sa-exec-worker</code>)</td>
+<td><code>SELECT</code> on <code>instructions</code>, <code>approvals</code>, <code>challenges</code>, <code>operators</code>, <code>credentials</code>, <code>executions</code>, <code>payments</code>, <code>audit_outbox</code>; <code>INSERT</code> on <code>executions</code>, <code>audit_outbox</code>; <code>UPDATE</code> on <code>executions(state, attempt_started_at, lease_owner, lease_until, binance_withdraw_id, binance_status, tx_id, last_error, updated_at)</code>, <code>instructions(state)</code>, <code>audit_outbox(shipped_seq, shipped_at)</code></td>
+</tr>
+<tr>
+<td><code>exec_admin</code></td>
+<td><code>exec-admin</code> (as <code>sa-exec-admin</code>)</td>
+<td><code>SELECT</code> on all; <code>INSERT</code> on <code>audit_outbox</code>; <code>EXECUTE</code> on <code>propose_admin_action(kind, payload)</code> (records the proposal; applies revocations and downgrades immediately) and <code>confirm_admin_action(id)</code> (security-definer: requires a different confirmer, then applies the action — including <code>approvals.voided_at</code> on revocation and <code>MANUAL_REVIEW</code> decisions). <strong>No direct write to any other table</strong></td>
+</tr>
+<tr>
+<td><code>exec_migrate</code></td>
+<td>Migration job in the deploy pipeline</td>
+<td>DDL; not usable at runtime</td>
+</tr>
+</tbody>
+</table>
+<p>No role has <code>DELETE</code>. Cloud SQL admin rights in <code>prj-exec</code> are held only by you (SC-19).</p>
+<h3 id="triggers">Triggers</h3>
+<ul>
+<li><code>instructions_immutable</code>: rejects any <code>UPDATE</code> that changes a column other than <code>state</code>.</li>
+<li><code>instructions_state_guard</code> and <code>executions_state_guard</code>: reject any state change not listed in the transitions table, keyed by <code>current_user</code> — <code>exec_web</code> may only perform approval-side transitions (to <code>APPROVED</code>, <code>CANCELLED</code>, <code>SUPERSEDED</code>, <code>PENDING_APPROVAL</code>), <code>exec_worker</code> only execution-side transitions, and the admin function only <code>MANUAL_REVIEW</code> → <code>CONFIRMED</code>/<code>FAILED</code> and <code>APPROVED</code> → <code>PENDING_APPROVAL</code> on revocation. A direct <code>UPDATE … SET state = 'APPROVED'</code> without a matching quorum is rejected by <code>instructions_state_guard</code>, which re-counts valid approvals itself.</li>
+<li><code>approvals_insert_guard</code>: the referenced challenge must be used, belong to the same operator, instruction and intent, and <code>instruction_hash</code> must equal the instruction's hash.</li>
+</ul>
+<h2 id="audit-events">Audit events</h2>
+<p>Every decision the service makes becomes a hash-chained event, written in the same database transaction as the state change and shipped to a locked bucket outside the execution servers within seconds.</p>
+<h3 id="event-envelope">Event envelope</h3>
+<pre><code class="language-json">{
+  &quot;seq&quot;: 18342,
+  &quot;event_id&quot;: &quot;evt_01JBXA2…&quot;,
+  &quot;type&quot;: &quot;approval.accepted&quot;,
+  &quot;time&quot;: &quot;2026-10-30T03:16:41.207Z&quot;,
+  &quot;environment&quot;: &quot;prod&quot;,
+  &quot;service_version&quot;: &quot;1.4.2+sha.9f1c2e7&quot;,
+  &quot;policy_version&quot;: &quot;2026-10-30.1&quot;,
+  &quot;actor&quot;: { &quot;kind&quot;: &quot;operator&quot;, &quot;id&quot;: &quot;op-0007&quot; },
+  &quot;instruction&quot;: { &quot;id&quot;: &quot;ins_01JBX9…&quot;, &quot;tms_payment_uuid&quot;: &quot;7d1f2c9e-…&quot;, &quot;version&quot;: 1,
+                   &quot;hash&quot;: &quot;39af9f50…d716d7&quot; },
+  &quot;data&quot;: { &quot;credential_id&quot;: &quot;base64url…&quot;, &quot;challenge_id&quot;: &quot;…&quot;, &quot;approvals&quot;: 1, &quot;required&quot;: 2 },
+  &quot;prev_hash&quot;: &quot;hex of previous event_hash&quot;,
+  &quot;event_hash&quot;: &quot;SHA-256(prev_hash || canonical(event without event_hash))&quot;
+}
+</code></pre>
+<h3 id="event-types">Event types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Recorded data (beyond the envelope)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>service.started</code>, <code>service.stopped</code></td>
+<td>Image digest, policy file SHA-256, config hash</td>
+</tr>
+<tr>
+<td><code>instruction.created</code></td>
+<td>Full canonical instruction, client certificate subject</td>
+</tr>
+<tr>
+<td><code>instruction.rejected_at_create</code></td>
+<td>Rule ID, field names (no values beyond the instruction itself)</td>
+</tr>
+<tr>
+<td><code>instruction.superseded</code>, <code>.cancelled</code>, <code>.expired</code></td>
+<td>Reason, superseding version</td>
+</tr>
+<tr>
+<td><code>challenge.issued</code></td>
+<td>Approval request (canonical), operator, expiry</td>
+</tr>
+<tr>
+<td><code>approval.accepted</code></td>
+<td>Credential ID, sign count, UV flag, verification result</td>
+</tr>
+<tr>
+<td><code>approval.rejected</code></td>
+<td>Failed step number and name, operator (if known)</td>
+</tr>
+<tr>
+<td><code>instruction.rejected_by_operator</code></td>
+<td>Operator, reason</td>
+</tr>
+<tr>
+<td><code>instruction.approved</code></td>
+<td>Operators in the quorum</td>
+</tr>
+<tr>
+<td><code>policy.decision</code></td>
+<td>Stage, outcome, rule ID</td>
+</tr>
+<tr>
+<td><code>execution.reserved</code>, <code>.sending</code></td>
+<td>Withdraw order ID</td>
+</tr>
+<tr>
+<td><code>execution.binance_response</code></td>
+<td>HTTP status, Binance code, Binance withdrawal ID; <strong>no request parameters beyond the instruction, no signature, no headers</strong></td>
+</tr>
+<tr>
+<td><code>execution.reconciled</code></td>
+<td>Binance status, txId, matched fields</td>
+</tr>
+<tr>
+<td><code>execution.unknown</code>, <code>.manual_review</code></td>
+<td>Error class, duration</td>
+</tr>
+<tr>
+<td><code>admin.*</code></td>
+<td>Operator added, role changed, credential enrolled or revoked, enrolment code issued, manual-review decision — with your identity and reason</td>
+</tr>
+<tr>
+<td><code>security.*</code></td>
+<td>Clone suspected, hash mismatch, unknown route, clock skew</td>
+</tr>
+</tbody>
+</table>
+<h3 id="never-logged">Never logged</h3>
+<p>Binance API key or secret, request signatures, full HTTP headers, WebAuthn private material (none exists server-side), session cookies, IAP JWTs, enrolment codes (only their hash).</p>
+<h3 id="storage">Storage</h3>
+<h3 id="verification-job">Verification job</h3>
+<ol>
+<li>The event is inserted into <code>audit_outbox</code> in the same transaction as the state change. It carries no chain fields yet.</li>
+<li>A single shipper (one <code>exec-worker</code> instance holding <code>pg_advisory_lock</code> on a fixed key, with automatic failover when the lock holder dies) reads unshipped rows in <code>id</code> order, assigns the next gap-free <code>shipped_seq</code>, computes <code>prev_hash</code> (the previous event's hash) and <code>event_hash = SHA-256(prev_hash || canonical(event with seq and prev_hash))</code>, and writes the object <code>gs://&lt;audit-bucket&gt;/prod/YYYY/MM/DD/&lt;shipped_seq&gt;.json</code> with <code>ifGenerationMatch=0</code> (create only). Only after the write succeeds does it record <code>shipped_seq</code> and <code>shipped_at</code>. Because one writer builds the chain, it cannot fork, and <code>audit_outbox.id</code> gaps from rolled-back transactions do not matter.</li>
+<li>The bucket in <code>prj-audit</code> has a locked retention policy; <code>sa-exec-worker</code> holds only <code>roles/storage.objectCreator</code>, so it cannot delete or replace objects.</li>
+<li>The executor refuses to move a payment from <code>RESERVED</code> to <code>SENDING</code> while more than 100 events, or events older than 60 seconds, are unshipped (audit backpressure).</li>
+<li>A redacted copy goes to stdout for Loki and Wazuh (addresses masked).</li>
+</ol>
+<h3 id="verification-job_1">Verification job</h3>
+<p>A daily job, run with a read-only identity in <code>prj-audit</code>, reads objects in <code>shipped_seq</code> order from the last checkpoint, checks that each <code>prev_hash</code> equals the previous object's <code>event_hash</code>, recomputes every <code>event_hash</code>, checks that <code>shipped_seq</code> has no gaps, and writes a signed checkpoint. It also compares the count of shipped events with <code>audit_outbox</code> rows older than 5 minutes. Any break raises a critical alert to you.</p>
+<h2 id="approver-and-passkey-administration">Approver and Passkey administration</h2>
+<p>Only the <code>exec-admin</code> process in <code>prj-exec</code>, used by two named admins under a two-person rule, can change who may approve; nothing in TMS, the main backend, the internet-facing <code>exec-web</code> process or Google Workspace group membership alone grants approval rights.</p>
+<p><strong>Admin access:</strong> the <code>exec-admin</code> process on its own hostname <code>exec-admin.&lt;domain&gt;</code>, own LB backend and IAP policy, limited to two named admins: <strong>you</strong> and a <strong>security officer</strong> (a second person you designate; also the break-glass holder). Both Google accounts use FIDO2 security keys, ideally with Advanced Protection. The admin process has no Binance secret access and can change data only through the two-person functions in the database.</p>
+<p><strong>Two-person rule:</strong> every roster or credential change and every manual <code>FAILED</code> decision is proposed by one admin and confirmed by the other. The database rejects a confirmation by the proposer. Revocations and role downgrades take effect immediately at proposal (they only reduce risk) and are confirmed afterwards for the record.</p>
+<h3 id="processes">Processes</h3>
+<table>
+<thead>
+<tr>
+<th>Process</th>
+<th>Steps</th>
+<th>Safeguards</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Add approver</strong></td>
+<td>1. Admin A proposes the operator (email, display name, role); admin B confirms. 2. A proposes an enrolment code; B confirms; the code (128-bit, 24 h expiry) is shown once to A, who hands it to the operator out of band (in person, or a call where you recognize them). 3. The operator signs in to <code>approve.&lt;domain&gt;</code> through IAP, opens <code>/enrol/&lt;code&gt;</code>, registers a Passkey with user verification.</td>
+<td>Operator and credential become usable only 24 h later (<code>active_from</code>); all existing approvers and both admins are notified at each step</td>
+</tr>
+<tr>
+<td><strong>Upgrade role</strong></td>
+<td>Proposed by A, confirmed by B; effective 24 h after confirmation</td>
+<td>Notification to all approvers</td>
+</tr>
+<tr>
+<td><strong>Downgrade role</strong></td>
+<td>Proposed by either admin; effective immediately</td>
+<td>Confirmed afterwards; audited</td>
+</tr>
+<tr>
+<td><strong>Replace Passkey</strong> (new device)</td>
+<td>A proposes an enrolment code for the existing operator; B confirms; operator registers; A or B revokes the old credential</td>
+<td>The new credential also waits 24 h, and all approvers are notified, so a stolen admin account cannot silently add Passkeys and approve immediately</td>
+</tr>
+<tr>
+<td><strong>Recover</strong> (lost device)</td>
+<td>Either admin revokes all of the operator's credentials immediately; then "Replace Passkey"</td>
+<td>Revocation within 15 minutes of the report, any time of day</td>
+</tr>
+<tr>
+<td><strong>Remove approver</strong></td>
+<td>Either admin revokes the operator; all their credentials are revoked; their approvals on unreserved instructions get <code>voided_at</code>, and any instruction that drops below quorum returns from <code>APPROVED</code> to <code>PENDING_APPROVAL</code></td>
+<td>Immediate; the executor re-counts approvals at reserve in any case</td>
+</tr>
+<tr>
+<td><strong>Manual-review decision</strong></td>
+<td><code>CONFIRMED</code> with Binance evidence: one admin. <code>FAILED</code>: proposed by A with evidence (Binance shows no record, support ticket), confirmed by B</td>
+<td>Reconciliation keeps watching a manually failed attempt for 7 days (see Execution state machine)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="rules">Rules</h3>
+<ul>
+<li>The approver roster never syncs from any directory; IAP group membership only controls who can load the page.</li>
+<li>Operators cannot change their own role or enrol for someone else; enrolment binds the code to the IAP identity that redeems it, which must match the operator's email.</li>
+<li>Admins are not approvers. If you want an admin to also approve, give them a separate operator identity and accept that this concentrates power; the two-person rule still applies to their roster changes.</li>
+<li>Monthly roster review by both admins, recorded as <code>admin.roster_reviewed</code>.</li>
+</ul>
+<h2 id="security-controls-checklist">Security controls checklist</h2>
+<p>Each control has an owner and evidence; the service does not go live until every row is checked.</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Control</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SC-01</td>
+<td>Binance key exists only in <code>prj-exec</code> Secret Manager; <code>sa-exec-worker</code> is the only accessor</td>
+<td>IAM policy export of the secret; Data Access logs show only <code>sa-exec-worker</code></td>
+</tr>
+<tr>
+<td>SC-02</td>
+<td>Old Binance code, config, SDK dependency and secrets removed from the main backend and TMS</td>
+<td>Merged PR; dependency scan shows no Binance SDK; secret deleted in <code>prj-platform</code></td>
+</tr>
+<tr>
+<td>SC-03</td>
+<td>All old Binance API keys deleted in Binance</td>
+<td>Binance API management listing only the new key, dated</td>
+</tr>
+<tr>
+<td>SC-04</td>
+<td>New key: withdrawals only (no trading, futures, margin, universal transfer unless in policy)</td>
+<td><code>GET /sapi/v1/account/apiRestrictions</code> output in the audit trail</td>
+</tr>
+<tr>
+<td>SC-05</td>
+<td>New key restricted to the <code>prj-exec</code> static egress IP</td>
+<td>Same output (<code>ipRestrict: true</code>) plus IP list</td>
+</tr>
+<tr>
+<td>SC-06</td>
+<td>Binance withdrawal address whitelist on, matching policy <code>destinations</code></td>
+<td>Screenshot plus diff against policy</td>
+</tr>
+<tr>
+<td>SC-07</td>
+<td>Exec VMs: no external IP, Shielded VM, OS Login, no project SSH keys, serial port off</td>
+<td><code>gcloud compute instances describe</code> output</td>
+</tr>
+<tr>
+<td>SC-08</td>
+<td>Egress denied except Binance FQDNs (from <code>exec-worker</code> only), Google APIs, PSC endpoints, Cloud SQL</td>
+<td>Firewall policy export; test from each VM type</td>
+</tr>
+<tr>
+<td>SC-09</td>
+<td>Ingress: <code>exec-web</code> from GFE ranges and PSC NAT only; <code>exec-worker</code> none; <code>exec-admin</code> from GFE only (IAP)</td>
+<td>Firewall policy export</td>
+</tr>
+<tr>
+<td>SC-10</td>
+<td>Containers run as non-root, read-only root filesystem, <code>no-new-privileges</code>, all capabilities dropped, default seccomp</td>
+<td><code>docker inspect</code> output</td>
+</tr>
+<tr>
+<td>SC-11</td>
+<td>Minimal images (distroless), dependencies pinned with hashes, SBOM, no critical vulnerabilities</td>
+<td>SBOM and scan report per release</td>
+</tr>
+<tr>
+<td>SC-12</td>
+<td>Binance client calls only the six endpoints in the Binance integration table; no URL or path input anywhere</td>
+<td>Unit test that any other path is refused; code review checklist</td>
+</tr>
+<tr>
+<td>SC-13</td>
+<td>Internal API accepts only the TMS client certificate; approval UI only through IAP + <code>waf-approve</code></td>
+<td>SEC-04, SEC-06</td>
+</tr>
+<tr>
+<td>SC-14</td>
+<td>No secrets in logs, traces, audit events or error messages</td>
+<td>SEC-07</td>
+</tr>
+<tr>
+<td>SC-15</td>
+<td>Production deploys, policy and config changes need your approval; CI has no <code>prj-exec</code> secret access</td>
+<td>Cloud Deploy config; CODEOWNERS; IAM export of the CI identity</td>
+</tr>
+<tr>
+<td>SC-16</td>
+<td>Audit bucket retention locked; <code>sa-exec-worker</code> objectCreator only</td>
+<td><code>gcloud storage buckets describe</code> (<code>isLocked: true</code>)</td>
+</tr>
+<tr>
+<td>SC-17</td>
+<td>Database grants, state-guard triggers and two-person functions as specified; no <code>DELETE</code></td>
+<td><code>\dp</code> output, trigger and function definitions; AT-11</td>
+</tr>
+<tr>
+<td>SC-18</td>
+<td>Admin hostname reachable only by the two admins</td>
+<td>IAP policy export</td>
+</tr>
+<tr>
+<td>SC-19</td>
+<td><strong>Privileged access to <code>prj-exec</code> and <code>prj-audit</code></strong>: Owner, Editor, Compute Admin, OS Admin Login, IAP tunnel user, Secret Manager Admin, Cloud SQL Admin, Service Account User/Token Creator on exec service accounts, Cloud KMS admin, DNS admin are held only by the break-glass group (you + security officer); no standing SSH</td>
+<td>Full IAM export of both projects and the folder, reviewed monthly; alert on any IAM change</td>
+</tr>
+<tr>
+<td>SC-20</td>
+<td><strong>Approval origin control</strong>: <code>approve.&lt;domain&gt;</code> and <code>exec-admin.&lt;domain&gt;</code> delegated to Cloud DNS in <code>prj-exec</code>; CAA records; Certificate Transparency monitoring</td>
+<td>DNS delegation record, CAA query output, CT monitor config</td>
+</tr>
+<tr>
+<td>SC-21</td>
+<td><strong>Process separation</strong>: <code>exec-web</code>, <code>exec-worker</code>, <code>exec-admin</code> on separate instance groups and service accounts with the access in System context</td>
+<td>IAM and instance template exports</td>
+</tr>
+</tbody>
+</table>
+<h2 id="build-deploy-and-configuration">Build, deploy and configuration</h2>
+<p>Code reaches production only as a signed image that you approved in Cloud Deploy; nothing in the build has access to production secrets, and configuration is part of the image.</p>
+<h3 id="repository-layout-binance-exec">Repository layout (<code>binance-exec</code>)</h3>
+<pre><code class="language-text">binance-exec/
+  web/                # exec-web: internal API, approval UI, WebAuthn            — CODEOWNERS: you
+  worker/             # exec-worker: executor, Binance client, reconciler, audit shipper — CODEOWNERS: you
+  admin/              # exec-admin: admin UI                                     — CODEOWNERS: you
+  shared/             # canonicalizer, policy engine, DB access                 — CODEOWNERS: you
+  policy/             # prod.yaml, staging.yaml                                  — CODEOWNERS: you
+  config/             # prod.yaml, staging.yaml (RP ID, origins, Binance base URL, timeouts) — CODEOWNERS: you
+  deploy/             # instance templates, startup scripts, Cloud Deploy config — CODEOWNERS: you
+  migrations/         # SQL migrations, triggers, functions (forward-only)      — CODEOWNERS: you
+  test/               # unit, integration (with Binance mock), acceptance
+  .github/            # CI workflows, CODEOWNERS                                 — CODEOWNERS: you
+</code></pre>
+<p>Branch protection on <code>main</code>: pull request required, CI green, a second engineer's review on everything, <strong>your review required on every path marked above</strong> (in practice, all production code), signed commits, no force pushes, no bypass for admins.</p>
+<h3 id="pipeline">Pipeline</h3>
+<ol>
+<li><strong>CI (GitHub Actions):</strong> lint, unit tests, integration tests against Postgres + Binance mock, acceptance suite, dependency and container scan, SBOM. The CI identity (Workload Identity Federation, restricted to <code>&lt;org&gt;/binance-exec</code> on <code>refs/heads/main</code>) can only push images to the exec Artifact Registry. It cannot sign for production and has no access to <code>prj-exec</code> secrets.</li>
+<li><strong>Release:</strong> Cloud Deploy release created with the image digests; the <code>staging</code> target rolls out automatically and runs the acceptance suite.</li>
+<li><strong>Approve:</strong> the <code>prod</code> target has <code>requireApproval: true</code>; only you hold <code>roles/clouddeploy.approver</code> on it.</li>
+<li><strong>Sign after approval:</strong> the first step of the approved <code>prod</code> rollout runs as the pipeline's prod execution service account, which alone has <code>roles/cloudkms.signer</code> on the <code>exec-prod-release</code> KMS key. It signs the exact digests you approved (Cosign, <code>gcpkms://</code>).</li>
+<li><strong>Roll out:</strong> custom target creates new instance templates and runs MIG rolling updates, one VM at a time; workers drain (stop reserving, finish in-flight <code>SENDING</code>, release leases) before exit.</li>
+<li><strong>Boot check:</strong> each VM's startup script runs <code>cosign verify --key gcpkms://…/exec-prod-release</code> on the image digest; if the signature is missing, the service does not start and <code>security.image_unverified</code> is raised. An image built from <code>main</code> but never approved by you therefore cannot run in production.</li>
+</ol>
+<h3 id="configuration">Configuration</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Where</th>
+<th>Changed by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Policy</td>
+<td><code>policy/&lt;env&gt;.yaml</code> inside the image</td>
+<td>PR with your review + your deploy approval</td>
+</tr>
+<tr>
+<td>Environment, RP ID, origins, Binance base URL, timeouts</td>
+<td><code>config/&lt;env&gt;.yaml</code> inside the image</td>
+<td>PR with your review + your deploy approval</td>
+</tr>
+<tr>
+<td>Binance key, TLS keys, DB connection</td>
+<td>Secret Manager in <code>prj-exec</code>, read at boot by the process that needs it</td>
+<td>You only</td>
+</tr>
+<tr>
+<td>Feature switches</td>
+<td>None at runtime</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="database-migrations">Database migrations</h3>
+<p>Forward-only migrations run by a Cloud Deploy pre-deploy job with the <code>exec_migrate</code> role. Destructive changes (drop, type narrowing) need two releases: stop using, then remove. Every migration is tested against a copy of production schema in staging first.</p>
+<h2 id="observability">Observability</h2>
+<p>The service exports metrics, structured logs and traces through the OTel Collector over its PSC endpoint, carrying IDs and states but never secrets or full addresses.</p>
+<h3 id="metrics-prometheus-names">Metrics (Prometheus names)</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exec_instructions_created_total</code></td>
+<td>counter</td>
+<td><code>asset</code>, <code>source_account</code></td>
+</tr>
+<tr>
+<td><code>exec_instructions_rejected_total</code></td>
+<td>counter</td>
+<td><code>stage</code> (create, approval, reserve), <code>rule_id</code></td>
+</tr>
+<tr>
+<td><code>exec_instruction_state</code></td>
+<td>gauge</td>
+<td><code>state</code></td>
+</tr>
+<tr>
+<td><code>exec_approvals_total</code></td>
+<td>counter</td>
+<td><code>result</code> (accepted, rejected), <code>failed_step</code></td>
+</tr>
+<tr>
+<td><code>exec_approval_latency_seconds</code></td>
+<td>histogram</td>
+<td>— (created → approved)</td>
+</tr>
+<tr>
+<td><code>exec_binance_requests_total</code></td>
+<td>counter</td>
+<td><code>endpoint</code>, <code>http_status</code>, <code>binance_code</code></td>
+</tr>
+<tr>
+<td><code>exec_binance_request_duration_seconds</code></td>
+<td>histogram</td>
+<td><code>endpoint</code></td>
+</tr>
+<tr>
+<td><code>exec_reconciliation_runs_total</code></td>
+<td>counter</td>
+<td><code>outcome</code></td>
+</tr>
+<tr>
+<td><code>exec_oldest_unknown_seconds</code></td>
+<td>gauge</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>exec_daily_limit_used_ratio</code></td>
+<td>gauge</td>
+<td><code>asset</code>, <code>source_account</code></td>
+</tr>
+<tr>
+<td><code>exec_audit_unshipped_events</code></td>
+<td>gauge</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>exec_api_unknown_route_total</code></td>
+<td>counter</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>exec_clock_skew_seconds</code></td>
+<td>gauge</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="log-fields">Log fields</h3>
+<p>JSON lines to stdout: <code>time</code>, <code>level</code>, <code>msg</code>, <code>request_id</code>, <code>trace_id</code>, <code>span_id</code>, <code>instruction_id</code>, <code>tms_payment_uuid</code>, <code>version</code>, <code>state</code>, <code>operator_id</code>, <code>policy_version</code>, <code>binance_code</code>. Addresses appear only masked (<code>TQ5u…x1aBz</code>). Amounts may be logged. Request bodies, headers, signatures and secrets are never logged.</p>
+<h3 id="traces">Traces</h3>
+<p>Spans: <code>POST /v1/instructions</code>, <code>policy.evaluate</code>, <code>webauthn.verify</code>, <code>executor.reserve</code>, <code>binance.withdraw_apply</code>, <code>binance.withdraw_history</code>, <code>audit.ship</code>. Attributes limited to IDs, states and Binance codes. Sampling: all spans for error and <code>UNKNOWN</code> paths are kept by the tail-sampling policy.</p>
+<h3 id="alerts">Alerts</h3>
+<table>
+<thead>
+<tr>
+<th>Alert</th>
+<th>Condition</th>
+<th>Severity → route</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unknown outcome</td>
+<td><code>exec_oldest_unknown_seconds &gt; 300</code></td>
+<td>High → ops on-call</td>
+</tr>
+<tr>
+<td>Manual review</td>
+<td>Any instruction in <code>MANUAL_REVIEW</code></td>
+<td>High → ops + you</td>
+</tr>
+<tr>
+<td>Hash mismatch / clone suspected / image unverified</td>
+<td>Any <code>security.*</code> event</td>
+<td>Critical → you, immediately</td>
+</tr>
+<tr>
+<td>Audit backlog</td>
+<td><code>exec_audit_unshipped_events &gt; 50</code> for 2 min</td>
+<td>High → you</td>
+</tr>
+<tr>
+<td>Approval attacks</td>
+<td><code>exec_approvals_total{result="rejected"}</code> &gt; 3 in 10 min</td>
+<td>Medium → ops + you</td>
+</tr>
+<tr>
+<td>Daily limit</td>
+<td><code>exec_daily_limit_used_ratio &gt; 0.8</code></td>
+<td>Medium → ops</td>
+</tr>
+<tr>
+<td>Binance errors</td>
+<td>5xx or <code>-1000</code> rate &gt; 0 for 5 min</td>
+<td>Medium → ops</td>
+</tr>
+<tr>
+<td>Clock skew</td>
+<td><code>exec_clock_skew_seconds &gt; 0.5</code></td>
+<td>Medium → platform</td>
+</tr>
+<tr>
+<td>Unknown routes</td>
+<td><code>exec_api_unknown_route_total</code> increases</td>
+<td>Medium → you</td>
+</tr>
+<tr>
+<td>Admin activity</td>
+<td>Any <code>admin.*</code> event, or any IAM change in <code>prj-exec</code> / <code>prj-audit</code></td>
+<td>Info → you (all approvers for roster changes)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="test-plan">Test plan</h2>
+<p>The acceptance tests (AT) prove the requirement document's acceptance criteria; they run in CI on every release against Postgres and the Binance mock, and once in production with small amounts before go-live.</p>
+<h3 id="acceptance-tests">Acceptance tests</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Scenario</th>
+<th>Steps</th>
+<th>Expected</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AT-01</td>
+<td>Modified details after approval</td>
+<td>Create v1 and approve fully; before reservation, TMS submits v2 with a different amount. Repeat with v1 already reserved</td>
+<td>First case: v1 <code>SUPERSEDED</code>, its approvals no longer count, v2 needs fresh approvals, Binance mock receives nothing for v1. Second case: <code>409 already_executing</code> for v2</td>
+</tr>
+<tr>
+<td>AT-02</td>
+<td>Expired approval</td>
+<td>Request challenge; wait 301 s; submit a valid assertion</td>
+<td>Rejected at step 2; <code>approval.rejected</code> (expired)</td>
+</tr>
+<tr>
+<td>AT-03</td>
+<td>Replayed approval</td>
+<td>Submit a valid assertion twice; then submit it for another instruction</td>
+<td>Second and third rejected (challenge used / mismatched)</td>
+</tr>
+<tr>
+<td>AT-04</td>
+<td>Unauthorized approval</td>
+<td>Revoked operator; operator below amount; operator or credential inside its 24 h activation delay; wrong RP origin</td>
+<td>All rejected; quorum unchanged</td>
+</tr>
+<tr>
+<td>AT-05</td>
+<td>Duplicate / concurrent execution</td>
+<td>Two worker instances, 50 parallel reserve attempts, TMS resubmits the same body 10 times</td>
+<td>Exactly one live attempt; exactly one Binance mock request; retries return <code>200</code> with the same record</td>
+</tr>
+<tr>
+<td>AT-06</td>
+<td>Threshold bypass</td>
+<td>Above-threshold instruction approved by one operator; same operator twice; second approver whose role does not cover the amount</td>
+<td>Stays <code>PENDING_APPROVAL</code>; duplicate and under-role approvals rejected</td>
+</tr>
+<tr>
+<td>AT-07</td>
+<td>Policy limits</td>
+<td>Amount &gt; per-tx max; daily max exceeded at reserve; non-allowlisted address; wrong network; memo missing where required; account mapping changed after approval</td>
+<td><code>422 policy_denied</code> at create, or <code>BLOCKED_BY_POLICY</code> at reserve</td>
+</tr>
+<tr>
+<td>AT-08</td>
+<td>Approval flag only</td>
+<td>TMS sends <code>"approved": true</code> or calls any non-existent execute route</td>
+<td><code>400 unknown_field</code> / <code>404</code>; nothing executed</td>
+</tr>
+<tr>
+<td>AT-09</td>
+<td>Timeout, then accepted</td>
+<td>Mock holds the response 15 s, then creates the withdrawal</td>
+<td><code>UNKNOWN</code> → reconciled to <code>ACCEPTED</code> → <code>CONFIRMED</code>; one request only</td>
+</tr>
+<tr>
+<td>AT-10</td>
+<td>Crash after send</td>
+<td>Kill the worker after the mock receives the body, before the response is stored; restart; meanwhile a second worker is mid-send on another payment</td>
+<td>Expired lease → <code>UNKNOWN</code> → reconciled; no second request; the other worker's in-flight row is untouched. Repeat with "mock never created it" → <code>MANUAL_REVIEW</code>, no resend</td>
+</tr>
+<tr>
+<td>AT-11</td>
+<td>Approval forged in the database</td>
+<td>As <code>exec_admin</code>, <code>exec_web</code>, <code>exec_worker</code> and a Cloud SQL user without approvals, try <code>UPDATE instructions SET state='APPROVED'</code>; also insert an approval row without a used challenge</td>
+<td>All rejected by triggers; even if a row were forced to <code>APPROVED</code>, reserve re-counts approvals and refuses</td>
+</tr>
+<tr>
+<td>AT-12</td>
+<td>Daily-limit race</td>
+<td>Two payments that together exceed the daily limit, reserved concurrently by two workers</td>
+<td>One reserved, the other <code>BLOCKED_BY_POLICY</code></td>
+</tr>
+<tr>
+<td>AT-13</td>
+<td>Revocation and two-person rule</td>
+<td>Revoke an approver after they approved; propose and confirm an action with the same admin; add a Passkey for an existing operator</td>
+<td>Instruction back to <code>PENDING_APPROVAL</code>; self-confirmation rejected; new Passkey unusable for 24 h and all approvers notified</td>
+</tr>
+</tbody>
+</table>
+<h3 id="unit-and-component-tests">Unit and component tests</h3>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>IDs</th>
+<th>Covers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Canonicalization</td>
+<td>T-CAN-01..07</td>
+<td>01 test vectors; 02 key ordering; 03 non-ASCII rejection; 04 amount regex valid forms; 05 each invalid amount form; 06 unknown and missing fields; 07 byte-for-byte stability across releases</td>
+</tr>
+<tr>
+<td>WebAuthn</td>
+<td>T-WA-01..09</td>
+<td>01 challenge derivation; 02 wrong origin; 03 wrong RP ID; 04 UV = 0; 05 bad signature; 06 counter regression; 07 foreign credential; 08 cross-origin flag; 09 instruction superseded between challenge and assert</td>
+</tr>
+<tr>
+<td>Policy</td>
+<td>T-POL-01..08</td>
+<td>01 each create rule; 02 role coverage per approver; 03 dual approval requires two distinct covering approvers; 04 reserve re-check with lowered limit; 05 <code>max(stored, current)</code> required approvals; 06 account mapping change blocks; 07 daily sum includes <code>ACCEPTED</code>; 08 policy file validation at start</td>
+</tr>
+<tr>
+<td>Executor</td>
+<td>T-EXE-01..07</td>
+<td>01 reserve guard and highest-version check; 02 <code>SENDING</code> committed before call (fault injected between); 03 executor reads only <code>canonical_json</code>; 04 hash recheck halts on mismatch; 05 one live attempt per payment (partial index); 06 lease recovery only for expired leases; 07 quorum re-count at reserve ignores voided and revoked approvals</td>
+</tr>
+<tr>
+<td>API</td>
+<td>T-API-01..06</td>
+<td>01 schema errors; 02 idempotent retry; 03 version conflict; 04 cancel rules; 05 unknown route 404 + metric; 06 body limit</td>
+</tr>
+<tr>
+<td>UI</td>
+<td>T-UI-01..05</td>
+<td>01 all fields rendered from stored instruction; 02 CSP and headers; 03 no external requests (headless browser network log); 04 approve disabled 3 s; 05 confirmation above threshold and signed rejection</td>
+</tr>
+<tr>
+<td>Admin</td>
+<td>T-ADM-01..05</td>
+<td>01 enrolment code single use and bound to identity; 02 24 h activation for operators, credentials and upgrades; 03 revocation voids approvals; 04 non-admin IAP identity denied; 05 two-person rule incl. manual <code>FAILED</code></td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>T-AUD-01..05</td>
+<td>01 every state change emits an event; 02 chain verifies; 03 tampering detected; 04 no secrets in events; 05 create-only object writes and single-writer shipper failover</td>
+</tr>
+</tbody>
+</table>
+<h3 id="security-tests">Security tests</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SEC-01..03</td>
+<td>Secret IAM, Data Access logs, old keys deleted in Binance (evidence review)</td>
+</tr>
+<tr>
+<td>SEC-04</td>
+<td>Internal API without a client cert, with a cert from another CA, with a valid cert not on the allowlist</td>
+</tr>
+<tr>
+<td>SEC-05</td>
+<td>From an exec VM: outbound to a non-allowlisted host fails; to Binance succeeds</td>
+</tr>
+<tr>
+<td>SEC-06</td>
+<td>Approval origin from a non-allowlisted IP, without IAP identity, inside an iframe</td>
+</tr>
+<tr>
+<td>SEC-07</td>
+<td>Log, trace and audit scan for secret patterns after a full staging run</td>
+</tr>
+<tr>
+<td>SEC-08</td>
+<td>Container runs as non-root, read-only, no capabilities (<code>docker inspect</code>)</td>
+</tr>
+<tr>
+<td>SEC-09</td>
+<td>Attempt prod deploy without your approval; CI identity attempts to read a <code>prj-exec</code> secret</td>
+</tr>
+<tr>
+<td>SEC-10</td>
+<td>Unsigned image on an exec VM is refused at boot</td>
+</tr>
+<tr>
+<td>SEC-11</td>
+<td><code>sa-exec</code> attempts to delete or overwrite an audit object</td>
+</tr>
+<tr>
+<td>SEC-12</td>
+<td>External penetration test of the approval origin and internal API before go-live</td>
+</tr>
+</tbody>
+</table>
+<h2 id="runbooks">Runbooks</h2>
+<p>Four situations need a written procedure; in all of them the rule is the same — never resend a payment whose outcome is uncertain.</p>
+<h3 id="rb-1-payment-stuck-in-unknown-or-manual_review">RB-1 Payment stuck in <code>UNKNOWN</code> or <code>MANUAL_REVIEW</code></h3>
+<ol>
+<li>Open the attempt in the admin UI; note <code>withdraw_order_id</code>, attempt time, last error.</li>
+<li>Check Binance withdrawal history in the Binance web console for that client ID and for amount + address in a ±30-minute window.</li>
+<li>Found → record the Binance withdrawal ID as evidence and mark <code>CONFIRMED</code> (or let reconciliation pick it up). Binance shows cancelled/rejected/failure → propose <code>FAILED</code> with that evidence; the other admin confirms.</li>
+<li>Not found after 2 hours and Binance support confirms no record → propose <code>FAILED</code> with the support ticket; the other admin confirms. Only then may TMS submit a new version, which needs fresh approvals and gets a new attempt number and <code>withdrawOrderId</code>. Reconciliation keeps watching the failed attempt for 7 days.</li>
+<li>Never ask engineering to "just re-run" the request.</li>
+</ol>
+<h3 id="rb-2-rotate-the-binance-api-key-every-90-days-or-immediately-on-suspicion">RB-2 Rotate the Binance API key (every 90 days, or immediately on suspicion)</h3>
+<ol>
+<li>In Binance, create the new key with the same restrictions (withdrawals only, IP-restricted to the exec egress IP).</li>
+<li>Add it as a new version of <code>binance-api-key</code> / <code>binance-api-secret</code> in <code>prj-exec</code>.</li>
+<li>Drain and roll <code>mig-exec</code> (Cloud Deploy redeploy of the current release); confirm <code>service.started</code> events and a successful history call.</li>
+<li>Delete the old key in Binance; disable the old secret versions.</li>
+<li>Record the rotation (<code>admin.key_rotated</code>) with the new key's restrictions output.</li>
+</ol>
+<h3 id="rb-3-revoke-an-approver-leaver-lost-device-suspicion">RB-3 Revoke an approver (leaver, lost device, suspicion)</h3>
+<ol>
+<li>Either admin: admin UI → operator → <strong>Revoke</strong> (operator and all credentials). Effective immediately; the other admin confirms afterwards.</li>
+<li>The service voids their approvals on unreserved instructions; instructions that drop below quorum return to <code>PENDING_APPROVAL</code> and the affected payments are listed for ops.</li>
+<li>Check the audit trail for approvals they gave in the last 30 days.</li>
+<li>Remove them from the IAP ops group.</li>
+<li>If compromise is suspected, also run RB-4 steps 1–3.</li>
+</ol>
+<h3 id="rb-4-suspected-compromise-stop-all-fund-movement">RB-4 Suspected compromise: stop all fund movement</h3>
+<ol>
+<li><strong>Kill switch:</strong> resize <code>mig-exec-worker</code> to 0 (<code>gcloud compute instance-groups managed resize mig-exec-worker --size=0 --region=$REGION --project=$EXEC_PROJECT</code>). No new Binance requests can be sent; approvals can still be collected but nothing executes.</li>
+<li>In Binance, disable the API key (or delete it).</li>
+<li>Disable <code>binance-api-key</code> secret versions.</li>
+<li>Preserve evidence: snapshot exec VM disks, export the audit bucket listing and Cloud Audit Logs for both projects, Wazuh alerts.</li>
+<li>Investigate with the audit chain verification job and Wazuh; rotate everything the investigation touches (Binance key, mTLS keys, admin account security key if relevant).</li>
+<li>Restart only after a new key is created and a fresh deploy is approved; reconcile every <code>UNKNOWN</code>, <code>ACCEPTED</code> and <code>SENDING</code> row first.</li>
+</ol>
+<h2 id="work-breakdown">Work breakdown</h2>
+<p>Ten epics in four phases; each task is done when its tests in the test plan pass and its audit events are emitted. Sizes are relative (S ≤ 2 days, M ≤ 1 week, L ≤ 2 weeks for one engineer) for planning, not commitments.</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Epic</th>
+<th>Key tasks</th>
+<th>Size</th>
+<th>Depends on</th>
+<th>Owner</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 Foundation</td>
+<td><strong>E1 Infrastructure</strong></td>
+<td>Folder, projects, org policies; <code>vpc-exec</code>, NAT static IP, FQDN egress policy; Cloud SQL; Secret Manager; audit bucket; PSC both ways; three instance groups and service accounts; approval and admin LBs with Cloud Armor and IAP; DNS delegation, CAA, CT monitoring; KMS release-signing key; privileged-access IAM (SC-19)</td>
+<td>L</td>
+<td>Decisions on region, domain, security officer</td>
+<td>Platform</td>
+</tr>
+<tr>
+<td>1 Foundation</td>
+<td><strong>E2 Pipeline</strong></td>
+<td><code>binance-exec</code> repo, CODEOWNERS, CI, WIF, Cloud Deploy staging/prod with approval, post-approval signing, boot-time signature check</td>
+<td>M</td>
+<td>E1</td>
+<td>Platform</td>
+</tr>
+<tr>
+<td>2 Core</td>
+<td><strong>E3 Instruction and API</strong> (<code>exec-web</code>)</td>
+<td>Canonicalizer + vectors; schema validation; account mapping into the instruction; <code>POST/GET/cancel</code>; mTLS + allowlist; per-payment lock, idempotency and versioning</td>
+<td>M</td>
+<td>E2</td>
+<td>Backend</td>
+</tr>
+<tr>
+<td>2 Core</td>
+<td><strong>E4 Policy engine</strong> (<code>shared</code>)</td>
+<td>YAML schema, loader, create/approval/quorum/reserve evaluation, daily sums with advisory lock</td>
+<td>M</td>
+<td>E3</td>
+<td>Backend</td>
+</tr>
+<tr>
+<td>2 Core</td>
+<td><strong>E5 WebAuthn and approval UI</strong> (<code>exec-web</code>)</td>
+<td>IAP JWT check; challenges with intent; verification algorithm with row lock; approval and signed rejection; enrolment finish function; UI integrity controls</td>
+<td>L</td>
+<td>E3, E4</td>
+<td>Backend + Frontend</td>
+</tr>
+<tr>
+<td>2 Core</td>
+<td><strong>E6 Worker and Binance client</strong> (<code>exec-worker</code>)</td>
+<td>Attempts, leases and lease recovery; reserve/send/record transactions with quorum re-count; Binance client (six endpoints, signing, classification); reconciliation incl. late-found watch; Binance mock</td>
+<td>L</td>
+<td>E3, E4</td>
+<td>Backend</td>
+</tr>
+<tr>
+<td>2 Core</td>
+<td><strong>E6b Database controls</strong></td>
+<td>DDL, per-role grants, immutability and state-guard triggers, approval insert guard, two-person functions</td>
+<td>M</td>
+<td>E3</td>
+<td>Backend</td>
+</tr>
+<tr>
+<td>3 Controls</td>
+<td><strong>E7 Audit and observability</strong></td>
+<td>Outbox; single-writer shipper with gap-free chain; backpressure; verification job; metrics, logs, traces, alerts</td>
+<td>M</td>
+<td>E3–E6</td>
+<td>Backend + Platform</td>
+</tr>
+<tr>
+<td>3 Controls</td>
+<td><strong>E8 Admin</strong> (<code>exec-admin</code>)</td>
+<td>Admin UI on its own hostname; propose/confirm flows; enrolment codes; activation delays and notifications; manual-review decisions; roster review</td>
+<td>M</td>
+<td>E5, E6b</td>
+<td>Backend</td>
+</tr>
+<tr>
+<td>4 Cutover</td>
+<td><strong>E9 TMS change and cutover</strong></td>
+<td>TMS client and state mapping; remove old Binance code and SDK; delete old secrets; new Binance key with restrictions and whitelist; production acceptance run; delete old Binance keys</td>
+<td>M</td>
+<td>E1–E8</td>
+<td>TMS team + you</td>
+</tr>
+</tbody>
+</table>
+<h3 id="definition-of-done-every-task">Definition of done (every task)</h3>
+<ul>
+<li><input type="checkbox" disabled> Unit and integration tests for the task pass in CI; relevant acceptance tests pass.</li>
+<li><input type="checkbox" disabled> Audit events for every state change in the task, verified in a test.</li>
+<li><input type="checkbox" disabled> No secrets in logs (CI log scan).</li>
+<li><input type="checkbox" disabled> Metrics and alerts added where the observability section lists them.</li>
+<li><input type="checkbox" disabled> Security checklist rows touched by the task have evidence attached.</li>
+<li><input type="checkbox" disabled> Reviewed by a second engineer; <code>policy/</code> and <code>deploy/</code> changes reviewed by you.</li>
+</ul>
+<h3 id="go-live-gate">Go-live gate</h3>
+<ul>
+<li><input type="checkbox" disabled> All AT-01..AT-10 green in staging and in the production dry run.</li>
+<li><input type="checkbox" disabled> SC-01..SC-18 evidence complete.</li>
+<li><input type="checkbox" disabled> Penetration test findings of high severity fixed (SEC-12).</li>
+<li><input type="checkbox" disabled> Runbooks RB-1..RB-4 rehearsed once in staging, including the kill switch.</li>
+<li><input type="checkbox" disabled> One small real withdrawal executed with dual approval and reconciled to <code>CONFIRMED</code>.</li>
+<li><input type="checkbox" disabled> Old Binance keys deleted and confirmed in Binance.</li>
+</ul>
+<h2 id="open-questions-and-sources">Open questions and sources</h2>
+<p>These need an answer before or during E1–E4; everything else in this spec can start now.</p>
+<ul>
+<li><input type="checkbox" disabled> Operations in scope: withdrawals only, or also internal / sub-account transfers (each needs its own endpoint, mapping and reconciliation design before it is added to policy).</li>
+<li><input type="checkbox" disabled> Travel rule: does the account's Binance entity require <code>localentity/withdraw/apply</code>? (Checked by endpoint 4 at start; if yes, the instruction schema gains travel-rule fields and they become part of the approval.)</li>
+<li><input type="checkbox" disabled> Asymmetric (Ed25519 or RSA) vs HMAC Binance key for the withdrawal endpoints on your account.</li>
+<li><input type="checkbox" disabled> Maximum <code>withdrawOrderId</code> length Binance accepts (34 characters planned), and whether history <code>amount</code> is gross or net of fee.</li>
+<li><input type="checkbox" disabled> Limits, dual-approval thresholds and role amounts per asset (remember: each approver must individually cover the amount).</li>
+<li><input type="checkbox" disabled> Passkey type: device-bound security keys (attestation + AAGUID allowlist) or synced platform Passkeys.</li>
+<li><input type="checkbox" disabled> Who the security officer (second admin and break-glass holder) is.</li>
+<li><input type="checkbox" disabled> Audit retention period before locking the bucket (irreversible).</li>
+<li><input type="checkbox" disabled> Service language and WebAuthn library (pick one from the WebAuthn section).</li>
+<li><input type="checkbox" disabled> Whether to record <code>tms_creator_id</code> for reporting (advisory only; not a security control).</li>
+</ul>
+<h3 id="sources">Sources</h3>
+<ul>
+<li>Requirement: "Refactor the Binance sending process" (internal document).</li>
+<li><a href="https://vika-researchpersonal.github.io/design-mausbot/gcp-platform-v2/">Platform Design v2 (infrastructure)</a></li>
+<li><a href="https://developers.binance.com/docs/wallet/capital/withdraw">Binance Wallet API — Withdraw</a> (parameters, <code>withdrawOrderId</code>, travel-rule check, <code>-4106</code> tag rule)</li>
+<li><a href="https://developers.binance.com/legacy-docs/wallet/capital/withdraw-history">Binance Wallet API — Withdraw History</a> (<code>withdrawOrderId</code> query, 7-day window, statuses)</li>
+<li><a href="https://developers.binance.com/docs/wallet">Binance Wallet API change log</a> (history query by <code>withdrawOrderId</code> added 2024-10-28)</li>
+<li><a href="https://developers.binance.com/zh-CN/docs/products/margin-trading/general-info">Binance general info — unknown error <code>-1000</code> / 5xx semantics</a></li>
+<li><a href="https://developers.binance.com/docs/binance-spot-api-docs/faqs/testnet">Binance Spot test network FAQ</a> (no <code>/sapi</code> on testnet; RSA and Ed25519 keys)</li>
+<li>W3C Web Authentication Level 2/3 (verification procedure); RFC 8785 JSON Canonicalization Scheme.</li>
+</ul>
+<p><a href="../">All designs</a></p>
+</body></html>

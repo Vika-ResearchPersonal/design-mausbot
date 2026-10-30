@@ -20,7 +20,7 @@
 </style></head>
 <body>
 <h1 id="gcp-application-platform-design-v2-with-binance-execution-service">GCP Application Platform Design v2 — with Binance Execution Service</h1>
-<p class="meta">Version 2 · Updated 30 Oct 2026 · <a href="../gcp-platform/">Version 1 (platform only)</a></p>
+<p class="meta">Version 2 · Updated 30 Oct 2026 · <a href="../gcp-platform/">Version 1 (platform only)</a> · <a href="../binance-exec-spec/">Engineering specification for the execution service</a></p>
 <nav><strong>Contents</strong><ol><li><a href="#overview">Overview</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#components">Components</a></li><li><a href="#binance-execution-service">Binance execution service</a></li><li><a href="#observability-and-security-monitoring">Observability and security monitoring</a></li><li><a href="#network-design">Network design</a></li><li><a href="#security-design">Security design</a></li><li><a href="#implementation-steps">Implementation steps</a></li><li><a href="#operations">Operations</a></li><li><a href="#risks-and-open-decisions">Risks and open decisions</a></li></ol></nav>
 <h2 id="overview">Overview</h2>
 <p>v2 keeps the v1 platform unchanged and adds a <strong>Binance execution service</strong> in its own GCP project, so that compromising the main application, its load balancer or its GCP project is not enough to move funds. The service is the only holder of the Binance funding credentials. It executes a payment only after it has itself verified ops Passkey approvals bound to the exact, immutable payment instruction.</p>

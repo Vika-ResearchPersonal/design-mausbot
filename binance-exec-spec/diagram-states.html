@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Execution state machine</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #bf4520;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body { font-family: var(--font-sans); background: var(--color-paper); color: var(--color-ink);
+      min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 3rem 2rem; }
+    .frame { max-width: 1200px; width: 100%; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    .eyebrow { font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500; letter-spacing: 0.18em;
+      text-transform: uppercase; color: var(--color-muted); margin-bottom: 0.5rem; }
+    h1 { font-family: var(--font-serif); font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem); font-weight: 400;
+      letter-spacing: -0.02em; line-height: 1.15; color: var(--color-ink); margin-bottom: 1.5rem; }
+    svg { width: 100%; min-width: 1080px; display: block; }
+    @media print { .diagram-container { overflow-x: visible; } svg { min-width: 0; } }
+  </style>
+</head>
+<body>
+  <div class="frame"><p class="eyebrow">State machine · Binance execution</p>
+<h1>A payment leaves Sending or Unknown only with evidence from Binance or an audited admin decision</h1>
+<div class="diagram-container"><svg viewBox="0 16 1080 368" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="exec-states-title exec-states-desc">
+<title id="exec-states-title">Execution state machine</title>
+<desc id="exec-states-desc">An instruction moves from pending approval through approved, reserved and sending to accepted and confirmed; definitive rejections and Binance failure statuses end in failed; timeouts go to unknown, which is reconciled to accepted or escalated to manual review after 15 minutes.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+</defs>
+<rect x="0" y="16" width="1080" height="368" fill="#f5f5f5"/>
+<line x1="144" y1="148" x2="192" y2="148" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="312" y1="148" x2="360" y2="148" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="480" y1="148" x2="528" y2="148" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="648" y1="148" x2="696" y2="148" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="816" y1="148" x2="864" y2="148" fill="none" stroke="#bf4520" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+<path d="M 624,120 V 68 Q 624,60 632,60 H 696" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="756" y1="120" x2="756" y2="88" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="588" y1="176" x2="588" y2="256" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 648,284 H 748 Q 756,284 756,276 V 176" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="528" y1="284" x2="480" y2="284" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="146" y="128" width="44" height="12" rx="2" fill="#f5f5f5"/><text x="168" y="137" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">QUORUM</text>
+<rect x="311" y="128" width="49" height="12" rx="2" fill="#f5f5f5"/><text x="336" y="137" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">RESERVE</text>
+<rect x="482" y="128" width="44" height="12" rx="2" fill="#f5f5f5"/><text x="504" y="137" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">COMMIT</text>
+<rect x="661" y="128" width="21" height="12" rx="2" fill="#f5f5f5"/><text x="672" y="137" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">ID</text>
+<rect x="824" y="128" width="32" height="12" rx="2" fill="#f5f5f5"/><text x="840" y="137" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">DONE</text>
+<rect x="506" y="84" width="105" height="12" rx="2" fill="#f5f5f5"/><text x="511" y="93" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="start" letter-spacing="0.06em">DEFINITIVE REJECT</text>
+<rect x="764" y="98" width="77" height="12" rx="2" fill="#f5f5f5"/><text x="769" y="107" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="start" letter-spacing="0.06em">STATUS 1·3·5</text>
+<rect x="596" y="210" width="128" height="12" rx="2" fill="#f5f5f5"/><text x="601" y="219" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="start" letter-spacing="0.06em">TIMEOUT · 5XX · -1000</text>
+<rect x="764" y="224" width="105" height="12" rx="2" fill="#f5f5f5"/><text x="769" y="233" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="start" letter-spacing="0.06em">FOUND BY ORDER ID</text>
+<rect x="482" y="292" width="44" height="12" rx="2" fill="#f5f5f5"/><text x="504" y="301" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">15 MIN</text>
+<rect x="24" y="120" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="24" y="120" width="120" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="84" y="145" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Pending</text><text x="84" y="162" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">PENDING_APPROVAL</text>
+<rect x="192" y="120" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="192" y="120" width="120" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="252" y="145" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Approved</text><text x="252" y="162" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">APPROVED</text>
+<rect x="360" y="120" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="360" y="120" width="120" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="420" y="145" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Reserved</text><text x="420" y="162" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">RESERVED</text>
+<rect x="528" y="120" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="528" y="120" width="120" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="588" y="145" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Sending</text><text x="588" y="162" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">SENDING · durable</text>
+<rect x="696" y="120" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="696" y="120" width="120" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="756" y="145" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Accepted</text><text x="756" y="162" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">ACCEPTED</text>
+<rect x="864" y="120" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="864" y="120" width="120" height="56" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+<text x="924" y="145" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Confirmed</text><text x="924" y="162" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">CONFIRMED</text>
+<rect x="696" y="32" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="696" y="32" width="120" height="56" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+<text x="756" y="57" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Failed</text><text x="756" y="74" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">FAILED</text>
+<rect x="528" y="256" width="120" height="56" rx="6" fill="#f5f5f5"/><rect x="528" y="256" width="120" height="56" rx="6" fill="rgba(191,69,32,0.05)" stroke="rgba(191,69,32,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+<text x="588" y="281" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Unknown</text><text x="588" y="298" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">UNKNOWN · reconcile</text>
+<rect x="336" y="256" width="144" height="56" rx="6" fill="#f5f5f5"/><rect x="336" y="256" width="144" height="56" rx="6" fill="rgba(191,69,32,0.05)" stroke="rgba(191,69,32,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+<text x="408" y="281" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Manual review</text><text x="408" y="298" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">admin + evidence</text>
+<text x="24" y="232" fill="#2d3142" font-size="13" font-style="italic" font-family="'Instrument Serif', serif">Early exits from pending or approved:</text><text x="24" y="250" fill="#2d3142" font-size="13" font-style="italic" font-family="'Instrument Serif', serif">cancelled · expired · superseded · blocked by policy</text>
+<line x1="24" y1="340" x2="1056" y2="340" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+<text x="24" y="364" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
+<rect x="104" y="354" width="20" height="14" rx="3" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/><text x="132" y="364" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Success</text>
+<rect x="200" y="354" width="20" height="14" rx="3" fill="rgba(191,69,32,0.05)" stroke="rgba(191,69,32,0.50)" stroke-width="1" stroke-dasharray="4,4"/><text x="228" y="364" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Uncertain: never resent automatically</text>
+<rect x="424" y="354" width="20" height="14" rx="3" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/><text x="452" y="364" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Terminal failure</text>
+<line x1="560" y1="361" x2="592" y2="361" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/><text x="600" y="364" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Transition</text>
+</svg></div></div></body></html>
